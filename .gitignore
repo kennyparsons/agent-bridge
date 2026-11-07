@@ -1,0 +1,21 @@
+# Build outputs
+/dist/
+/bin/
+/agent-bridge
+/agent-bridge.exe
+
+# PKI, Cluster State & Certificate Material
+/pki/
+/certs/
+/agent-bridge-data/
+cluster-state*.json
+*.key
+*.crt
+*.pem
+
+# Local configuration & secrets
+.env
+
+# Test artifacts
+coverage.out
+*.test
