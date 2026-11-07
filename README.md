@@ -1,6 +1,6 @@
 # agent-bridge
 
-Static, zero-dependency Go binary (`v0.1.0`) for synchronous remote command execution and multi-node security-state replication over private overlay networks (e.g., Tailscale) using Mutual TLS 1.3, self-contained ECDSA P-256 PKI, hot-reloading Certificate Revocation Lists (CRLs), and transactional WebSockets (`wss://<endpoint>/ws/exec`).
+Static, zero-dependency Go binary (`v0.1.1`) for synchronous remote command execution and multi-node security-state replication over private overlay networks (e.g., Tailscale) using Mutual TLS 1.3, self-contained ECDSA P-256 PKI, hot-reloading Certificate Revocation Lists (CRLs), and transactional WebSockets (`wss://<endpoint>/ws/exec`).
 
 - **Protocol & Security Specification**: [spec.md](spec.md)
 - **Clustering Architecture Decision Record**: [docs/ADR-001-clustering.md](docs/ADR-001-clustering.md)
@@ -9,7 +9,7 @@ Static, zero-dependency Go binary (`v0.1.0`) for synchronous remote command exec
 ## Verification Status
 
 > [!IMPORTANT]
-> `agent-bridge` has passed automated unit, race-detector, cryptographic, and multi-daemon loopback suites on Linux `amd64`, **but has not yet been executed on live Windows Server hardware or a multi-host Tailscale network**. Follow [docs/FIELD-VALIDATION-RUNBOOK.md](docs/FIELD-VALIDATION-RUNBOOK.md) gate-by-gate before production rollout.
+> Standalone (`N=1`) Windows Server 2022 execution, Win32 Job Object process-tree cleanup, live NTFS `crl.pem` hot-reload, and cross-OS Debian 12 -> Windows Server 2022 mTLS 1.3 execution have been field-validated. Multi-node (`N >= 2`) cross-host Tailscale clustering remains pending live multi-host field rollout per Gates 4–5 of [docs/FIELD-VALIDATION-RUNBOOK.md](docs/FIELD-VALIDATION-RUNBOOK.md).
 
 | Scope | Status | Details |
 | :--- | :--- | :--- |
@@ -17,10 +17,9 @@ Static, zero-dependency Go binary (`v0.1.0`) for synchronous remote command exec
 | **X.509v3 & RFC 5280 CRL Cryptography** | **Verified** | Cross-checked against `openssl x509` / `openssl crl` (`ECDSA P-256` + `SHA-256`, 128-bit positive serials, SKI/AKI, IP/DNS SANs, CA `NotAfter` clamping, monotonic `CRLNumber`). |
 | **POSIX Process Isolation & Stream Bounds** | **Verified** | Linux `Setpgid` + `-pgid` `SIGKILL` orphan cleanup on timeout/disconnect, `10 MiB` per-stream overflow cutoff (`exit 137`), and 8-bit POSIX exit-code normalization. |
 | **Multi-Daemon Cluster Mesh (`127.0.0.1`)** | **Verified** | Single-host `N=1`, `N=2`, and `N=3` daemons verified for `~55ms` CRL gossip, Mode A CSR join + peer CSR forwarding, Mode B offline-CA PoP join, failover, minority-partition Graceful Degradation, and EKU/ACL privilege boundaries. |
-| **Static Cross-Compilation (`CGO_ENABLED=0`)** | **Verified** | Clean `go vet` and static binary builds for `windows/amd64`, `linux/amd64`, `linux/arm64`, and `darwin/arm64`. |
-| **Live Windows Server 2022 (`WIN-DC-01` / `WIN-DC-02`)** | **Pending Field Test** | Real Win32 Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) child-tree kill, NTFS `icacls` DACLs, and `os.Rename` atomic swaps under Windows Defender / EDR real-time scanning. |
-| **Windows Service Wrapper & Tailscale Boot Race** | **Pending Field Test** | `WinSW` / `NSSM` service lifecycle, `Tailscale` service dependency ordering, and `3s` restart-on-failure recovery while `100.x.y.z` initializes on reboot. |
-| **Multi-Host Tailscale / Routed-Subnet Mesh** | **Pending Field Test** | Cross-host WireGuard / DERP latency, Windows Defender Firewall interface scoping (`8443/tcp`, `8444/tcp`), and live Domain Controller reboot failover. |
+| **Static Cross-Compilation (`CGO_ENABLED=0`)** | **Verified** | Clean `go vet` and static `-trimpath` binary builds (symbols retained to minimize heuristic AV ML false positives) for `windows/amd64`, `linux/amd64`, `linux/arm64`, and `darwin/arm64`. |
+| **Live Windows Server 2022 (`N=1` Standalone) & Cross-OS Client** | **Verified** | Field-validated on Windows Server 2022 (`powershell.exe` under `NT AUTHORITY\SYSTEM`, Win32 Job Object child `ping.exe` tree-kill with `0` orphans, `10 MiB` overflow `137`, `80ms` NTFS `crl.pem` hot-reload, NTFS `icacls` DACLs, Scheduled Task supervisor persistence, and Debian 12 `linux/amd64` -> Windows Server 2022 mTLS 1.3 execution). |
+| **Multi-Host Tailscale / Routed-Subnet Mesh (`N >= 2`)** | **Pending Field Test** | Cross-host WireGuard / DERP gossip latency, live `N >= 2` Windows/Linux cluster join over Tailscale (`8444/tcp`), and live Domain Controller reboot failover. |
 
 ## Security & Execution Architecture
 
@@ -49,7 +48,7 @@ Static, zero-dependency Go binary (`v0.1.0`) for synchronous remote command exec
 
 ## Build & Cross-Compilation
 
-Requires Go `1.26+`. All targets compile with `CGO_ENABLED=0`, `-trimpath`, and `-ldflags="-s -w"`.
+Requires Go `1.26+`. All targets compile with `CGO_ENABLED=0` and `-trimpath` (symbol and DWARF sections are preserved to reduce heuristic AV ML false positives on unsigned builds).
 
 ```bash
 make build      # Host binary -> bin/agent-bridge
@@ -70,7 +69,7 @@ make test       # Full go test -race suite
 ### Version & Help
 
 ```bash
-agent-bridge version     # Also accepts --version, -version, -v -> "agent-bridge v0.1.0"
+agent-bridge version     # Also accepts --version, -version, -v -> "agent-bridge v0.1.1"
 agent-bridge --help      # Subcommand help: agent-bridge <cmd> [subcmd] --help
 ```
 
