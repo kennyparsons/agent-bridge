@@ -1,6 +1,6 @@
 # Field Validation & Live Infrastructure Bring-Up Runbook
 
-`agent-bridge v0.1.0` has been verified on Linux `amd64` across Go `-race` suites, OpenSSL X.509v3/CRL checks, and multi-daemon `127.0.0.1` loopback meshes, **but has not yet been tested on live Windows Server hosts or a multi-host Tailscale overlay**.
+`agent-bridge v0.1.1` has been verified across Go `-race` suites, OpenSSL X.509v3/CRL checks, multi-daemon `127.0.0.1` loopback meshes, standalone (`N=1`) Windows Server 2022 (`powershell.exe`, Win32 Job Objects, NTFS `icacls`, `80ms` NTFS `crl.pem` hot-reload, Scheduled Task supervision), and cross-OS Debian 12 -> Windows Server 2022 mTLS 1.3 execution. **Multi-host (`N >= 2`) Tailscale clustering (Gates 4–5) remains to be validated on live multi-server infrastructure.**
 
 Execute the five gates below in order when bringing up real hardware (e.g., `WIN-DC-01`, `WIN-DC-02`, and Linux hosts). Do not advance past a gate until every pass criterion in that gate succeeds.
 

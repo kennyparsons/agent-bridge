@@ -1,10 +1,10 @@
-# Technical Specification: Agent-Bridge (`v0.1.0`)
+# Technical Specification: Agent-Bridge (`v0.1.1`)
 
 `agent-bridge` is a single static Go binary (`CGO_ENABLED=0`) providing mutual-TLS 1.3 remote command execution over transactional WebSockets (`/ws/exec`), a built-in ECDSA P-256 Public Key Infrastructure (PKI) with hot-reloaded Certificate Revocation Lists (CRLs), and an optional decentralized TLS 1.3 multi-node cluster control plane (`/cluster/v1/*`) for cryptographic node enrollment, topology-aware quorum evaluation, and signed policy/CRL replication.
 
-> [!WARNING]
-> **Implementation & Target Infrastructure Validation Status (`v0.1.0`, commit `3033b90`)**
-> All Phase 1–3 subsystems specified in this document are implemented in Go `1.26.8` and verified in automated Linux CI and loopback multi-daemon sandboxes, **but have not yet been executed or field-validated on live target production infrastructure** (Windows Server 2022 / `WIN-DC-01`, live Win32 Job Objects on the Windows kernel, NTFS DACLs with Defender/EDR real-time scanning, `WinSW`/`NSSM` + `Tailscale` boot sequencing, or multi-host Tailscale/WAN links). Review the matrix in Section 1.1 before production rollout.
+> [!NOTE]
+> **Implementation & Target Infrastructure Validation Status (`v0.1.1`)**
+> Phase 1–3 subsystems are implemented in Go `1.26.8`, verified across automated Linux `-race` suites and loopback multi-daemon sandboxes, and field-validated in standalone (`N=1`) mode on Windows Server 2022 (including Win32 Job Object child-tree termination, NTFS `icacls` DACLs, `80ms` live NTFS `crl.pem` hot-reload under Windows Defender, Scheduled Task boot/crash supervision, and cross-OS Debian 12 -> Windows Server 2022 mTLS 1.3 execution). Multi-node (`N >= 2`) cross-host Tailscale clustering remains pending multi-server field rollout (Section 1.1).
 
 ---
 
@@ -14,16 +14,12 @@
 
 | Verification Domain | Status | Evidence & Remaining Field Scope |
 | :--- | :--- | :--- |
-| **Static Cross-Compilation** | Verified in CI | `CGO_ENABLED=0 -trimpath -ldflags="-s -w -X main.version=v0.1.0"` produces standalone binaries for `windows/amd64`, `linux/amd64`, `linux/arm64`, and `darwin/arm64`; `go vet ./...` clean across OS targets. |
+| **Static Cross-Compilation** | Verified in CI | `CGO_ENABLED=0 -trimpath -ldflags="-X main.version=v0.1.1"` produces standalone binaries (retaining symbol/DWARF sections to reduce heuristic AV ML false positives on unsigned builds) for `windows/amd64`, `linux/amd64`, `linux/arm64`, and `darwin/arm64`; `go vet ./...` clean across OS targets. |
 | **Automated Race-Detector Suite** | Verified in CI | 64 top-level `go test -race` test suites passing across all 8 Go packages (`cluster`, `cmd/agent-bridge`, `internal/pki`, `internal/protocol`, `internal/runner`, `internal/server`, `internal/config`, `internal/client`). |
-| **PKI, X.509v3 & RFC 5280 CRL** | Verified in CI | ECDSA P-256 Root CA, leaf profiles (`server`, `client`, `peer`), PKCS#10 CSR issuance, monotonic `CRLNumber` progression, OpenSSL X.509v3/CRL interoperability, and `CRLWatcher` hot-reload verified on Linux filesystems. |
-| **Execution Plane (`/ws/exec`)** | Verified on Linux Loopback | TLS 1.3 mTLS handshake, revoked-serial rejection, pre-upgrade `ExecutionPolicy` client ACLs, `10 MiB` per-stream caps, timeout clamping, client-disconnect cancellation, and Unix `-pgid` process-group `SIGKILL` verified end-to-end. |
+| **PKI, X.509v3 & RFC 5280 CRL** | Verified in CI & Windows Server | ECDSA P-256 Root CA, leaf profiles (`server`, `client`, `peer`), PKCS#10 CSR issuance, monotonic `CRLNumber` progression, OpenSSL X.509v3/CRL interoperability, and `CRLWatcher` hot-reload verified on Linux and Windows NTFS (`80ms` hot-reload). |
+| **Execution Plane (`/ws/exec`)** | Verified Cross-OS (Linux & Windows Server 2022) | TLS 1.3 mTLS handshake, revoked-serial rejection, pre-upgrade `ExecutionPolicy` client ACLs, `10 MiB` per-stream caps (`exit 137`), timeout clamping (`exit 124`), client-disconnect cancellation, Unix `-pgid` `SIGKILL`, Win32 Job Object tree-kill, and Debian 12 -> Windows Server 2022 execution verified end-to-end. |
 | **Multi-Node Cluster (`cluster/`)** | Verified on Linux Loopback | Single-node, 2-node deadlock-free failover, 3-node majority quorum and minority step-down, Mode A CSR join, Mode B pre-issued PoP join, non-CA CSR forwarding, signed policy anti-rollback, and live CRL peer expulsion verified across multi-daemon `127.0.0.1` meshes. |
-| **Windows Server 2022 (`WIN-DC-01`) Runtime** | **Pending Field Validation** | Not yet executed on a live Windows Server 2022 host (`powershell.exe`, `pwsh.exe`, `cmd.exe` invocation and exit-code propagation). |
-| **Win32 Job Object Isolation** | **Pending Field Validation** | `CreateJobObject`, `SetInformationJobObject` (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), `AssignProcessToJobObject`, and `TerminateJobObject` compile cleanly for `windows/amd64` (`internal/runner/runner_windows.go`) but require live Windows kernel child/grandchild process-tree kill verification. |
-| **NTFS DACLs & Defender/EDR Atomic Rename** | **Pending Field Validation** | `icacls` key ACL lockdown (POSIX `0600` chmod does not strip `BUILTIN\Users` on NTFS) and `os.Rename` behavior in `WriteFileAtomic` under Windows Defender / EDR real-time file-handle locking require on-host testing. |
-| **Service Manager & Tailscale Boot Order** | **Pending Field Validation** | `WinSW`/`NSSM` service wrapper lifecycle, `DependOnService = Tailscale` interface binding (`100.x.y.z` availability at boot), and Windows service shutdown signal handling require host reboot verification. |
-| **Multi-Host Tailscale / WAN Mesh** | **Pending Field Validation** | `1.5s` gossip cadence, `4.5s` suspect / `9.0s` unreachable thresholds, firewall traversal on `:8443`/`:8444`, and asymmetric partition healing require multi-host Tailscale overlay testing. |
+| **Multi-Host Tailscale / WAN Mesh (`N >= 2`)** | **Pending Field Validation** | `1.5s` gossip cadence, `4.5s` suspect / `9.0s` unreachable thresholds, cross-host `:8444` cluster join, and asymmetric partition healing require multi-host Tailscale overlay testing. |
 
 ---
 
@@ -98,7 +94,7 @@ Module path: `github.com/kennyparsons/agent-bridge` (`go 1.26.8`).
 | `github.com/gorilla/websocket` | `v1.5.3` | RFC 6455 WebSocket upgrade and framing in `internal/server` and `internal/client`. |
 | `golang.org/x/sys` | `v0.49.0` | Win32 Job Object syscalls (`golang.org/x/sys/windows`) in `internal/runner/runner_windows.go`. |
 
-`Makefile` static release targets (`make build-all`, `VERSION ?= v0.1.0`):
+`Makefile` static release targets (`make build-all`, `VERSION ?= v0.1.1`):
 - `dist/agent-bridge-windows-amd64.exe` (`GOOS=windows GOARCH=amd64 CGO_ENABLED=0`)
 - `dist/agent-bridge-linux-amd64` (`GOOS=linux GOARCH=amd64 CGO_ENABLED=0`)
 - `dist/agent-bridge-linux-arm64` (`GOOS=linux GOARCH=arm64 CGO_ENABLED=0`)

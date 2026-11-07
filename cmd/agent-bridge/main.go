@@ -26,7 +26,7 @@ import (
 	"github.com/kennyparsons/agent-bridge/internal/server"
 )
 
-var version = "v0.1.0"
+var version = "v0.1.1"
 
 const (
 	exitOK    = 0

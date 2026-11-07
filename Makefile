@@ -2,9 +2,9 @@ BINARY_NAME := agent-bridge
 CMD_PKG     := ./cmd/agent-bridge
 BIN_DIR     := bin
 DIST_DIR    := dist
-VERSION     ?= v0.1.0
+VERSION     ?= v0.1.1
 GOFLAGS     := -trimpath
-LDFLAGS     := -s -w -X main.version=$(VERSION)
+LDFLAGS     := -X main.version=$(VERSION)
 
 .PHONY: all build build-all test vet clean
 
