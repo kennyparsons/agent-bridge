@@ -1272,6 +1272,11 @@ func RenewPeerCert(ctx context.Context, opts RenewOptions) (*RenewResult, error)
 		if err := renewResp.SignedPolicy.Verify(caCert, caPool, nil); err != nil {
 			return nil, fmt.Errorf("RenewPeerCert: RenewResponse SignedPolicy failed signature verification: %w", err)
 		}
+		if signerCert, sigCertErr := parseSingleCertificatePEM([]byte(renewResp.SignedPolicy.SignerCertPEM)); sigCertErr == nil {
+			if !signerCert.IsCA && isSerialInCRL(parsedCRL, signerCert.SerialNumber) {
+				return nil, errors.New("RenewPeerCert: RenewResponse SignedPolicy was signed by a revoked certificate")
+			}
+		}
 		effectivePolicy = renewResp.SignedPolicy.Policy
 	}
 
@@ -1509,13 +1514,18 @@ func (e *Engine) handleRenew(w http.ResponseWriter, r *http.Request) {
 	}
 
 	callerLeaf := r.TLS.PeerCertificates[0]
+	callerCN := strings.TrimSpace(callerLeaf.Subject.CommonName)
 	if strings.TrimSpace(req.NodeID) == "" {
-		req.NodeID = strings.TrimSpace(callerLeaf.Subject.CommonName)
+		req.NodeID = callerCN
+	}
+	if strings.TrimSpace(req.NodeID) != callerCN {
+		writeJSONError(w, http.StatusForbidden, fmt.Sprintf("caller certificate CommonName %q does not match renew node_id %q", callerCN, strings.TrimSpace(req.NodeID)))
+		return
 	}
 	callerSerialHex := pki.FormatSerialHex(callerLeaf.SerialNumber)
 	observedRemoteIP := extractRemoteIP(r.RemoteAddr)
 
-	resp, statusCode, err := e.processRenewRequest(r.Context(), req, callerSerialHex, observedRemoteIP, true)
+	resp, statusCode, err := e.processRenewRequest(r.Context(), req, callerSerialHex, callerCN, observedRemoteIP, true)
 	if err != nil {
 		writeJSONError(w, statusCode, err.Error())
 		return
@@ -1546,7 +1556,7 @@ func (e *Engine) handleSignJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if fwd.RenewRequest != nil {
-		resp, statusCode, err := e.processRenewRequest(r.Context(), *fwd.RenewRequest, fwd.CallerCertSerial, fwd.ObservedRemoteIP, false)
+		resp, statusCode, err := e.processRenewRequest(r.Context(), *fwd.RenewRequest, fwd.CallerCertSerial, fwd.CallerCertCN, fwd.ObservedRemoteIP, false)
 		if err != nil {
 			writeJSONError(w, statusCode, err.Error())
 			return
@@ -1644,6 +1654,38 @@ func (e *Engine) processJoinRequest(
 		return nil, http.StatusBadRequest, errors.New("join request must supply exactly one of csr_pem or existing_cert_pem")
 	}
 
+	var preValidatedCert *x509.Certificate
+	if hasCSR {
+		csrCN, csrErr := parseCSRCommonName([]byte(req.CSRPEM))
+		if csrErr != nil || strings.TrimSpace(csrCN) != nodeID {
+			if csrErr != nil {
+				return nil, http.StatusForbidden, fmt.Errorf("invalid join CSR CommonName: %w", csrErr)
+			}
+			return nil, http.StatusForbidden, fmt.Errorf("CSR CommonName %q must match join node_id %q", csrCN, nodeID)
+		}
+	} else {
+		existingCert, parseErr := parseSingleCertificatePEM([]byte(req.ExistingCertPEM))
+		if parseErr != nil {
+			return nil, http.StatusBadRequest, fmt.Errorf("invalid existing_cert_pem: %w", parseErr)
+		}
+		if strings.TrimSpace(existingCert.Subject.CommonName) != nodeID {
+			return nil, http.StatusForbidden, fmt.Errorf(
+				"pre-issued certificate CommonName %q must match join node_id %q",
+				existingCert.Subject.CommonName, nodeID,
+			)
+		}
+		if _, verifyErr := pki.VerifyPeerCertDualEKU([][]byte{existingCert.Raw}, e.caPool, e.crlWatcher); verifyErr != nil {
+			return nil, http.StatusForbidden, fmt.Errorf("pre-issued certificate rejected: %w", verifyErr)
+		}
+		if !slices.Contains(existingCert.ExtKeyUsage, x509.ExtKeyUsageServerAuth) {
+			return nil, http.StatusBadRequest, errors.New("pre-issued node certificate must include ServerAuth extended key usage")
+		}
+		if err := verifyJoinPoP(existingCert, parsedTok.TokenID, nodeID, normClusterAddr, req.PoPSignatureBase64); err != nil {
+			return nil, http.StatusUnauthorized, fmt.Errorf("join proof-of-possession verification failed: %w", err)
+		}
+		preValidatedCert = existingCert
+	}
+
 	if hasCSR && (!e.hasCAKey || e.caKey == nil) {
 		if !allowForward {
 			return nil, http.StatusServiceUnavailable, errors.New(
@@ -1676,20 +1718,7 @@ func (e *Engine) processJoinRequest(
 		issuedCertPEM = string(signedPEM)
 		admittedCert = signedCert
 	} else {
-		existingCert, parseErr := parseSingleCertificatePEM([]byte(req.ExistingCertPEM))
-		if parseErr != nil {
-			return nil, http.StatusBadRequest, fmt.Errorf("invalid existing_cert_pem: %w", parseErr)
-		}
-		if _, verifyErr := pki.VerifyPeerCertDualEKU([][]byte{existingCert.Raw}, e.caPool, e.crlWatcher); verifyErr != nil {
-			return nil, http.StatusForbidden, fmt.Errorf("pre-issued certificate rejected: %w", verifyErr)
-		}
-		if !slices.Contains(existingCert.ExtKeyUsage, x509.ExtKeyUsageServerAuth) {
-			return nil, http.StatusBadRequest, errors.New("pre-issued node certificate must include ServerAuth extended key usage")
-		}
-		if err := verifyJoinPoP(existingCert, parsedTok.TokenID, nodeID, normClusterAddr, req.PoPSignatureBase64); err != nil {
-			return nil, http.StatusUnauthorized, fmt.Errorf("join proof-of-possession verification failed: %w", err)
-		}
-		admittedCert = existingCert
+		admittedCert = preValidatedCert
 	}
 
 	serialHex := pki.FormatSerialHex(admittedCert.SerialNumber)
@@ -1783,6 +1812,7 @@ func (e *Engine) processRenewRequest(
 	ctx context.Context,
 	req RenewRequest,
 	callerSerialHex string,
+	callerCN string,
 	observedRemoteIP string,
 	allowForward bool,
 ) (*RenewResponse, int, error) {
@@ -1801,6 +1831,13 @@ func (e *Engine) processRenewRequest(
 	callerSerialHex = strings.TrimSpace(callerSerialHex)
 	if callerSerialHex == "" {
 		return nil, http.StatusUnauthorized, errors.New("missing authenticated peer certificate serial")
+	}
+	callerCN = strings.TrimSpace(callerCN)
+	if callerCN == "" || callerCN != nodeID {
+		return nil, http.StatusForbidden, fmt.Errorf(
+			"caller certificate CommonName %q does not match renew node_id %q",
+			callerCN, nodeID,
+		)
 	}
 
 	normClusterAddr, err := normalizeBindOrAdvertiseAddr(req.ClusterAddr, config.DefaultClusterPort, true)
@@ -1848,47 +1885,15 @@ func (e *Engine) processRenewRequest(
 		return nil, http.StatusBadRequest, errors.New("renew request must supply exactly one of csr_pem or existing_cert_pem")
 	}
 
+	var preValidatedReplacement *x509.Certificate
 	if hasCSR {
 		csrCN, csrErr := parseCSRCommonName([]byte(req.CSRPEM))
 		if csrErr != nil {
 			return nil, http.StatusBadRequest, csrErr
 		}
-		if csrCN != nodeID {
+		if strings.TrimSpace(csrCN) != nodeID {
 			return nil, http.StatusForbidden, fmt.Errorf("CSR CommonName %q must match renewing peer node_id %q", csrCN, nodeID)
 		}
-
-		if !e.hasCAKey || e.caKey == nil {
-			if !allowForward {
-				return nil, http.StatusServiceUnavailable, errors.New(
-					"cannot sign CSR on renew: authority node lacks --ca-key; pass --ca-key on an authority node or pre-issue replacement cert/key with 'agent-bridge ca issue'",
-				)
-			}
-			return e.forwardRenewToAuthorityPeer(ctx, req, callerSerialHex, observedRemoteIP)
-		}
-	}
-
-	var (
-		issuedCertPEM string
-		admittedCert  *x509.Certificate
-	)
-
-	if hasCSR {
-		extraIPs, extraDNS := buildServerSideExtraSANs(observedRemoteIP, normClusterAddr, normExecAddr, req.Hostname, req.ExtraIPs, req.ExtraDNSNames)
-		signedPEM, signedCert, signErr := pki.SignNodeCSR(
-			[]byte(req.CSRPEM),
-			e.caCert,
-			e.caKey,
-			pki.SignCSROptions{
-				ExtraIPs:           extraIPs,
-				ExtraDNSNames:      extraDNS,
-				ServerAndClientEKU: true,
-			},
-		)
-		if signErr != nil {
-			return nil, http.StatusBadRequest, fmt.Errorf("CSR renewal signing failed: %w", signErr)
-		}
-		issuedCertPEM = string(signedPEM)
-		admittedCert = signedCert
 	} else {
 		existingCert, parseErr := parseSingleCertificatePEM([]byte(req.ExistingCertPEM))
 		if parseErr != nil {
@@ -1915,7 +1920,47 @@ func (e *Engine) processRenewRequest(
 		if err := verifyRenewPoP(existingCert, callerSerialHex, nodeID, normClusterAddr, req.PoPSignatureBase64); err != nil {
 			return nil, http.StatusUnauthorized, fmt.Errorf("renew proof-of-possession verification failed: %w", err)
 		}
-		admittedCert = existingCert
+		preValidatedReplacement = existingCert
+	}
+
+	if (hasCSR || req.RevokeOldSerial) && (!e.hasCAKey || e.caKey == nil) {
+		if !allowForward {
+			if hasCSR {
+				return nil, http.StatusServiceUnavailable, errors.New(
+					"cannot sign CSR on renew: authority node lacks --ca-key; pass --ca-key on an authority node or pre-issue replacement cert/key with 'agent-bridge ca issue'",
+				)
+			}
+			return nil, http.StatusServiceUnavailable, errors.New(
+				"cannot revoke old certificate serial on renew: authority node lacks --ca-key",
+			)
+		}
+		return e.forwardRenewToAuthorityPeer(ctx, req, callerSerialHex, callerCN, observedRemoteIP)
+	}
+
+	var (
+		issuedCertPEM string
+		admittedCert  *x509.Certificate
+	)
+
+	if hasCSR {
+		extraIPs, extraDNS := buildServerSideExtraSANs(observedRemoteIP, normClusterAddr, normExecAddr, req.Hostname, req.ExtraIPs, req.ExtraDNSNames)
+		signedPEM, signedCert, signErr := pki.SignNodeCSR(
+			[]byte(req.CSRPEM),
+			e.caCert,
+			e.caKey,
+			pki.SignCSROptions{
+				ExtraIPs:           extraIPs,
+				ExtraDNSNames:      extraDNS,
+				ServerAndClientEKU: true,
+			},
+		)
+		if signErr != nil {
+			return nil, http.StatusBadRequest, fmt.Errorf("CSR renewal signing failed: %w", signErr)
+		}
+		issuedCertPEM = string(signedPEM)
+		admittedCert = signedCert
+	} else {
+		admittedCert = preValidatedReplacement
 	}
 
 	newSerialHex := pki.FormatSerialHex(admittedCert.SerialNumber)
@@ -1945,6 +1990,15 @@ func (e *Engine) processRenewRequest(
 
 	polVer := uint64(0)
 	if e.signedPolicy != nil {
+		if req.RevokeOldSerial && e.hasCAKey && e.caKey != nil && nodeID != e.nodeID &&
+			policySignerMatchesSerial(e.signedPolicy, callerSerialHex) {
+			if reSigned, reSignErr := e.reSignPolicyWithCALocked(e.signedPolicy, now); reSignErr == nil {
+				e.signedPolicy = reSigned
+				e.storePolicySnapshotLocked(reSigned.Policy)
+			} else {
+				e.logf("warning: failed re-signing cluster policy with Root CA before revoking %s [%s]: %v", nodeID, callerSerialHex, reSignErr)
+			}
+		}
 		polVer = e.signedPolicy.Policy.Version
 		signedPolCopy = e.signedPolicy.Clone()
 	}
@@ -1999,10 +2053,25 @@ func (e *Engine) processRenewRequest(
 			e.logf("warning: failed revoking old peer serial [%s] during renew of %s: %v", callerSerialHex, nodeID, revErr)
 		} else {
 			oldSerialRevoked = revoked
-			// Refresh CRLNumber on self/peers snapshot after CRL bump.
+			// Refresh CRLNumber on self/peers snapshot after CRL bump, and ensure active
+			// SignedPolicy remains verifiable against the updated CRL (re-signing with CA if needed).
 			e.mu.Lock()
+			if e.signedPolicy != nil && (policySignerMatchesSerial(e.signedPolicy, callerSerialHex) ||
+				e.signedPolicy.Verify(e.caCert, e.caPool, e.crlWatcher) != nil) {
+				if reSigned, reSignErr := e.reSignPolicyWithCALocked(e.signedPolicy, now); reSignErr == nil {
+					e.signedPolicy = reSigned
+					e.storePolicySnapshotLocked(reSigned.Policy)
+				} else {
+					e.logf("warning: failed re-signing cluster policy with Root CA after revoking %s [%s]: %v", nodeID, callerSerialHex, reSignErr)
+				}
+			}
+			if e.signedPolicy != nil {
+				polVer = e.signedPolicy.Policy.Version
+				signedPolCopy = e.signedPolicy.Clone()
+			}
 			if p, ok := e.peers[nodeID]; ok && p != nil {
 				p.CRLNumber = e.currentCRLNumberString()
+				p.PolicyVersion = polVer
 			}
 			e.refreshSelfLocked(now)
 			eval = EvaluateQuorum(e.nodeID, e.peersSliceLocked())
@@ -2036,6 +2105,30 @@ func (e *Engine) peerMatchesSerial(nodeID, serialHex string) bool {
 	defer e.mu.RUnlock()
 	p, ok := e.peers[nodeID]
 	return ok && p != nil && strings.EqualFold(strings.TrimSpace(p.CertSerialHex), strings.TrimSpace(serialHex))
+}
+
+func policySignerMatchesSerial(env *SignedPolicyEnvelope, serialHex string) bool {
+	if env == nil || strings.TrimSpace(env.SignerCertPEM) == "" || strings.TrimSpace(serialHex) == "" {
+		return false
+	}
+	cert, err := parseSingleCertificatePEM([]byte(env.SignerCertPEM))
+	if err != nil || cert.IsCA || cert.SerialNumber == nil {
+		return false
+	}
+	return strings.EqualFold(pki.FormatSerialHex(cert.SerialNumber), strings.TrimSpace(serialHex))
+}
+
+// reSignPolicyWithCALocked re-signs curEnv.Policy using the Root CA certificate and private key,
+// advancing UpdatedAtUnix by at least +1 so ComparePolicyEnvelope(reSigned, curEnv) > 0 across all nodes.
+// Caller must hold e.mu.Lock() and ensure e.hasCAKey && e.caKey != nil && curEnv != nil.
+func (e *Engine) reSignPolicyWithCALocked(curEnv *SignedPolicyEnvelope, now time.Time) (*SignedPolicyEnvelope, error) {
+	nextPol := curEnv.Policy
+	nextUpdated := now.Unix()
+	if nextUpdated <= curEnv.Policy.UpdatedAtUnix {
+		nextUpdated = curEnv.Policy.UpdatedAtUnix + 1
+	}
+	nextPol.UpdatedAtUnix = nextUpdated
+	return SignPolicyEnvelope(nextPol, e.nodeID, e.caCert, e.caKey)
 }
 
 func (e *Engine) revokeSerialInClusterCRL(serialHex string, now time.Time) (bool, error) {
@@ -2243,12 +2336,18 @@ func (e *Engine) forwardRenewToAuthorityPeer(
 	ctx context.Context,
 	req RenewRequest,
 	callerSerialHex string,
+	callerCN string,
 	observedRemoteIP string,
 ) (*RenewResponse, int, error) {
 	candidates := e.authorityPeersForCSR()
 	if len(candidates) == 0 {
+		if strings.TrimSpace(req.CSRPEM) != "" {
+			return nil, http.StatusBadRequest, errors.New(
+				"cannot sign CSR on renew: no active cluster node holds Root CA private key (--ca-key); pass --ca-key on an authority node or pre-issue replacement server.crt and server.key with 'agent-bridge ca issue'",
+			)
+		}
 		return nil, http.StatusBadRequest, errors.New(
-			"cannot sign CSR on renew: no active cluster node holds Root CA private key (--ca-key); pass --ca-key on an authority node or pre-issue replacement server.crt and server.key with 'agent-bridge ca issue'",
+			"cannot revoke old certificate serial on renew: no active cluster node holds Root CA private key (--ca-key)",
 		)
 	}
 
@@ -2256,6 +2355,7 @@ func (e *Engine) forwardRenewToAuthorityPeer(
 	fwdPayload := signJoinForwardRequest{
 		RenewRequest:     &reqCopy,
 		CallerCertSerial: callerSerialHex,
+		CallerCertCN:     callerCN,
 		ObservedRemoteIP: observedRemoteIP,
 	}
 	encoded, err := json.Marshal(fwdPayload)
@@ -2299,7 +2399,7 @@ func (e *Engine) forwardRenewToAuthorityPeer(
 		}
 
 		if httpResp.StatusCode != http.StatusOK {
-			apiErr := decodeClusterHTTPError(httpResp.StatusCode, respBytes, "authority peer rejected CSR renew")
+			apiErr := decodeClusterHTTPError(httpResp.StatusCode, respBytes, "authority peer rejected renew")
 			if httpResp.StatusCode >= 400 && httpResp.StatusCode < 500 {
 				return nil, httpResp.StatusCode, apiErr
 			}
@@ -2313,12 +2413,29 @@ func (e *Engine) forwardRenewToAuthorityPeer(
 			continue
 		}
 
+		if strings.TrimSpace(renewResp.CRLPEM) != "" && e.crlWatcher != nil {
+			_, _, _ = e.crlWatcher.ApplyCRLPEM([]byte(renewResp.CRLPEM))
+		}
+
+		var verifiedRenewPol *SignedPolicyEnvelope
+		if renewResp.SignedPolicy != nil {
+			if err := renewResp.SignedPolicy.Verify(e.caCert, e.caPool, e.crlWatcher); err == nil {
+				verifiedRenewPol = renewResp.SignedPolicy.Clone()
+			}
+		}
+
 		now := time.Now().UTC()
 		var persistSnap *persistedClusterState
 		var persistSeq uint64
 		var mergedPeers []PeerInfo
 
 		e.mu.Lock()
+		if verifiedRenewPol != nil && (e.signedPolicy == nil ||
+			verifiedRenewPol.IsNewerThan(e.signedPolicy) ||
+			e.signedPolicy.Verify(e.caCert, e.caPool, e.crlWatcher) != nil) {
+			e.signedPolicy = verifiedRenewPol
+			e.storePolicySnapshotLocked(verifiedRenewPol.Policy)
+		}
 		for _, p := range renewResp.Peers {
 			if p.NodeID == "" || p.NodeID == e.nodeID {
 				continue
@@ -2345,10 +2462,6 @@ func (e *Engine) forwardRenewToAuthorityPeer(
 
 		_ = e.writePersistedSnapshot(persistSnap, persistSeq)
 
-		if strings.TrimSpace(renewResp.CRLPEM) != "" && e.crlWatcher != nil {
-			_, _, _ = e.crlWatcher.ApplyCRLPEM([]byte(renewResp.CRLPEM))
-		}
-
 		renewResp.Peers = mergedPeers
 		e.triggerAsyncBroadcast(renewResp.OldSerialRevoked)
 		return &renewResp, http.StatusOK, nil
@@ -2357,7 +2470,7 @@ func (e *Engine) forwardRenewToAuthorityPeer(
 	if lastErr == nil {
 		lastErr = errors.New("no reachable authority node with --ca-key")
 	}
-	return nil, http.StatusBadGateway, fmt.Errorf("failed forwarding CSR renew to authority peer: %w", lastErr)
+	return nil, http.StatusBadGateway, fmt.Errorf("failed forwarding renew to authority peer: %w", lastErr)
 }
 
 func (e *Engine) hasTokenID(tokenID string) bool {

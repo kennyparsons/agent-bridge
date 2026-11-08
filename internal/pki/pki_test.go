@@ -19,6 +19,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/kennyparsons/agent-bridge/internal/acl"
 )
 
 func TestSerialHexFormattingAndParsing(t *testing.T) {
@@ -653,5 +655,21 @@ func TestIssueCertClampsToCANotAfterAndRejectsExpiredCA(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("IssueCert against expired CA = %v, want error containing 'expired'", err)
+	}
+}
+
+func TestWriteFileAtomicPrivateACLLockdown(t *testing.T) {
+	parentDir := filepath.Join(t.TempDir(), "permissive-parent")
+	if err := os.MkdirAll(parentDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	privPath := filepath.Join(parentDir, "secret.abbundle")
+	if err := WriteFileAtomic(privPath, []byte("sensitive-bundle-material"), 0o600); err != nil {
+		t.Fatalf("WriteFileAtomic(0600): %v", err)
+	}
+	st, err := acl.AuditPathACL(privPath, false)
+	if err != nil || !st.Secure {
+		t.Fatalf("AuditPathACL(%s) = %+v, err=%v; want Secure=true", privPath, st, err)
 	}
 }

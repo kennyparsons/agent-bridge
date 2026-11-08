@@ -326,11 +326,12 @@ func (m *mockServiceManager) RunManagedService(_ string, fn func(context.Context
 }
 
 func TestBuildAndExecuteDetachedRestartWithRollback(t *testing.T) {
-	args, err := BuildDetachedRestartArgs("agent-bridge", "/tmp/agent-bridge.old", 1500*time.Millisecond)
+	rbPath := filepath.Join(t.TempDir(), "agent-bridge.old")
+	args, err := BuildDetachedRestartArgs("agent-bridge", rbPath, 1500*time.Millisecond)
 	if err != nil {
 		t.Fatalf("BuildDetachedRestartArgs: %v", err)
 	}
-	wantArgs := []string{"service", "_detached-restart", "--name", "agent-bridge", "--delay", "1.5s", "--rollback-bin", "/tmp/agent-bridge.old"}
+	wantArgs := []string{"service", "_detached-restart", "--name", "agent-bridge", "--delay", "1.5s", "--rollback-bin", rbPath}
 	if !reflect.DeepEqual(args, wantArgs) {
 		t.Fatalf("BuildDetachedRestartArgs = %v, want %v", args, wantArgs)
 	}

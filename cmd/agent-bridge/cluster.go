@@ -898,7 +898,7 @@ func runClusterRejoin(ctx context.Context, args []string, stdin io.Reader, stdou
 			serverCfg.NoAutoSANs = effectiveNoAutoSANs
 			cfgChanged = true
 		}
-		if len(parsedSeeds) > 0 && visited["seed"] || visited["join"] {
+		if len(parsedSeeds) > 0 && (visited["seed"] || visited["join"]) {
 			serverCfg.SeedPeers = parsedSeeds
 			cfgChanged = true
 		}

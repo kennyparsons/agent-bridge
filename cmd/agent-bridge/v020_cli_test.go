@@ -151,6 +151,43 @@ func hasIPv6Loopback() bool {
 	return true
 }
 
+type bgCLIServer struct {
+	out      syncBuffer
+	err      syncBuffer
+	stopOnce sync.Once
+	cancel   context.CancelFunc
+	done     chan int
+	exitCode int
+}
+
+// startBackgroundCLIServer launches `runContext` in a background goroutine and registers an
+// idempotent LIFO `t.Cleanup` handler so all listeners, CRL watchers, cluster engines, and
+// rotating log files are guaranteed closed BEFORE an earlier `t.TempDir()` runs `os.RemoveAll`
+// (critical on Windows where open handles fail directory removal).
+func startBackgroundCLIServer(t *testing.T, args []string) *bgCLIServer {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := &bgCLIServer{
+		cancel: cancel,
+		done:   make(chan int, 1),
+	}
+	go func() {
+		srv.done <- runContext(ctx, args, &srv.out, &srv.err)
+	}()
+	t.Cleanup(func() {
+		_ = srv.stop()
+	})
+	return srv
+}
+
+func (s *bgCLIServer) stop() int {
+	s.stopOnce.Do(func() {
+		s.cancel()
+		s.exitCode = <-s.done
+	})
+	return s.exitCode
+}
+
 func TestV020CLIHelpUsageAndVersionJSON(t *testing.T) {
 	// Verify `version --json`.
 	{
@@ -271,18 +308,12 @@ func TestV020MultiBindAutoSANsBundleClientInitVerifyHostAndExec(t *testing.T) {
 	execV4 := net.JoinHostPort("127.0.0.1", strconv.Itoa(execPort))
 	execV6 := net.JoinHostPort("::1", strconv.Itoa(execPort))
 
-	srvCtx, cancelSrv := context.WithCancel(context.Background())
-	defer cancelSrv()
-	srvDone := make(chan int, 1)
-	var srvOut, srvErr syncBuffer
-	go func() {
-		srvDone <- runContext(srvCtx, []string{
-			"server",
-			"--bind", bindSpec,
-			"--port", strconv.Itoa(execPort),
-			"--data-dir", caDir,
-		}, &srvOut, &srvErr)
-	}()
+	srv := startBackgroundCLIServer(t, []string{
+		"server",
+		"--bind", bindSpec,
+		"--port", strconv.Itoa(execPort),
+		"--data-dir", caDir,
+	})
 	waitForTCPPort(t, execV4, 5*time.Second)
 	if hasV6 {
 		waitForTCPPort(t, execV6, 5*time.Second)
@@ -428,9 +459,8 @@ func TestV020MultiBindAutoSANsBundleClientInitVerifyHostAndExec(t *testing.T) {
 		"--json",
 	})
 
-	cancelSrv()
-	if code := <-srvDone; code != exitOK {
-		t.Fatalf("server exited with %d: stderr=%s", code, srvErr.String())
+	if code := srv.stop(); code != exitOK {
+		t.Fatalf("server exited with %d: stderr=%s", code, srv.err.String())
 	}
 }
 
@@ -481,16 +511,10 @@ func TestV020ClusterJoinStatusRejoinTokenlessSANRotationAndRevokeSync(t *testing
 		t.Fatalf("SaveServerDaemonConfig(node-a): %v", err)
 	}
 
-	ctxA, cancelA := context.WithCancel(context.Background())
-	defer cancelA()
-	doneA := make(chan int, 1)
-	var outA, errA syncBuffer
-	go func() {
-		doneA <- runContext(ctxA, []string{
-			"server",
-			"--service-config", nodeACfgPath,
-		}, &outA, &errA)
-	}()
+	_ = startBackgroundCLIServer(t, []string{
+		"server",
+		"--service-config", nodeACfgPath,
+	})
 	waitForTCPPort(t, execAddrA, 5*time.Second)
 
 	// 2. Verify server-local fallback (`--data-dir` without `--cluster-addr`, `--cert`, `--key`, `--ca`).
@@ -536,26 +560,21 @@ func TestV020ClusterJoinStatusRejoinTokenlessSANRotationAndRevokeSync(t *testing
 		t.Fatalf("unmarshal cluster join --json: %v (%s)", err, joinOutRaw)
 	}
 
-	startNodeB := func() (context.CancelFunc, chan int) {
-		ctxB, cancelB := context.WithCancel(context.Background())
-		doneB := make(chan int, 1)
-		var outB, errB syncBuffer
-		go func() {
-			doneB <- runContext(ctxB, []string{
-				"server",
-				"--bind", "127.0.0.1",
-				"--port", strconv.Itoa(execPortB),
-				"--cluster-bind", clusterAddrB,
-				"--seed", clusterAddrA,
-				"--node-id", "node-b",
-				"--data-dir", nodeBDir,
-			}, &outB, &errB)
-		}()
+	startNodeB := func() *bgCLIServer {
+		srvB := startBackgroundCLIServer(t, []string{
+			"server",
+			"--bind", "127.0.0.1",
+			"--port", strconv.Itoa(execPortB),
+			"--cluster-bind", clusterAddrB,
+			"--seed", clusterAddrA,
+			"--node-id", "node-b",
+			"--data-dir", nodeBDir,
+		})
 		waitForTCPPort(t, execAddrB, 5*time.Second)
-		return cancelB, doneB
+		return srvB
 	}
 
-	cancelB1, doneB1 := startNodeB()
+	srvB1 := startNodeB()
 
 	// Verify TLS handshake asserting new IP SAN 198.51.100.25 FAILS prior to `cluster rejoin`.
 	{
@@ -603,13 +622,8 @@ func TestV020ClusterJoinStatusRejoinTokenlessSANRotationAndRevokeSync(t *testing
 	}
 
 	// Restart node-b so it loads the rotated server.crt with 198.51.100.25 SAN.
-	cancelB1()
-	<-doneB1
-	cancelB2, doneB2 := startNodeB()
-	defer func() {
-		cancelB2()
-		<-doneB2
-	}()
+	_ = srvB1.stop()
+	_ = startNodeB()
 
 	// 5. Verify direct TLS 1.3 handshake + `client verify` against newly added IP SAN 198.51.100.25 SUCCEEDS!
 	cliTLSCert, err := tls.LoadX509KeyPair(
@@ -805,16 +819,10 @@ func TestV020ServiceInstallSecretFreeConfigMergeLogsAndDetachedRestart(t *testin
 		t.Fatalf("SaveServerDaemonConfig(seed): %v", err)
 	}
 
-	ctxSeed, cancelSeed := context.WithCancel(context.Background())
-	defer cancelSeed()
-	doneSeed := make(chan int, 1)
-	var seedOut, seedErr syncBuffer
-	go func() {
-		doneSeed <- runContext(ctxSeed, []string{
-			"server",
-			"--service-config", seedCfgPath,
-		}, &seedOut, &seedErr)
-	}()
+	_ = startBackgroundCLIServer(t, []string{
+		"server",
+		"--service-config", seedCfgPath,
+	})
 	waitForTCPPort(t, seedClusterAddr, 5*time.Second)
 
 	secretJoinToken := strings.TrimSpace(mustRunCLI(t, []string{
@@ -865,21 +873,15 @@ func TestV020ServiceInstallSecretFreeConfigMergeLogsAndDetachedRestart(t *testin
 	overrideExecPort := freeLoopbackPort(t)
 	overrideExecAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(overrideExecPort))
 
-	ctxSvc, cancelSvc := context.WithCancel(context.Background())
-	doneSvc := make(chan int, 1)
-	var svcOut, svcErr syncBuffer
-	go func() {
-		doneSvc <- runContext(ctxSvc, []string{
-			"server",
-			"--service-config", cfgPath,
-			"--port", strconv.Itoa(overrideExecPort),
-		}, &svcOut, &svcErr)
-	}()
+	srvSvc := startBackgroundCLIServer(t, []string{
+		"server",
+		"--service-config", cfgPath,
+		"--port", strconv.Itoa(overrideExecPort),
+	})
 	waitForTCPPort(t, overrideExecAddr, 5*time.Second)
 
-	cancelSvc()
-	if code := <-doneSvc; code != exitOK {
-		t.Fatalf("service-config server exited with %d: stderr=%s", code, svcErr.String())
+	if code := srvSvc.stop(); code != exitOK {
+		t.Fatalf("service-config server exited with %d: stderr=%s", code, srvSvc.err.String())
 	}
 
 	// 3. Verify `service logs` reads the rotating daemon log written by `server --service-config`.

@@ -451,6 +451,7 @@ type signJoinForwardRequest struct {
 	JoinRequest      JoinRequest   `json:"join_request"`
 	RenewRequest     *RenewRequest `json:"renew_request,omitempty"`
 	CallerCertSerial string        `json:"caller_cert_serial,omitempty"`
+	CallerCertCN     string        `json:"caller_cert_cn,omitempty"`
 	ObservedRemoteIP string        `json:"observed_remote_ip,omitempty"`
 	TokenRecord      *TokenRecord  `json:"token_record,omitempty"`
 }

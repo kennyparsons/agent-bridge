@@ -896,6 +896,14 @@ func writeFileAtomic(targetPath string, data []byte, perm os.FileMode) error {
 		}
 	}()
 
+	isPrivate := perm&0o077 == 0 || strings.HasSuffix(strings.ToLower(targetPath), ".key")
+	if isPrivate {
+		if err := acl.LockdownPrivateFile(tmpPath); err != nil {
+			_ = tmpFile.Close()
+			return fmt.Errorf("failed to enforce private ACL on temporary file %q: %w", tmpPath, err)
+		}
+	}
+
 	if _, err := tmpFile.Write(data); err != nil {
 		_ = tmpFile.Close()
 		return fmt.Errorf("failed to write temporary file %q: %w", tmpPath, err)
@@ -915,7 +923,7 @@ func writeFileAtomic(targetPath string, data []byte, perm os.FileMode) error {
 	}
 	cleanup = false
 
-	if perm&0o077 == 0 || strings.HasSuffix(strings.ToLower(targetPath), ".key") {
+	if isPrivate {
 		if err := acl.LockdownPrivateFile(targetPath); err != nil {
 			return fmt.Errorf("failed to enforce private ACL on %q: %w", targetPath, err)
 		}
