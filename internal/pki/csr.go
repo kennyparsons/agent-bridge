@@ -13,6 +13,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/kennyparsons/agent-bridge/internal/acl"
 )
 
 // SignCSROptions configures how SignNodeCSR signs an incoming node Certificate Signing Request.
@@ -74,6 +76,31 @@ func GenerateKeyAndCSR(
 		Bytes: csrDER,
 	})
 
+	return priv, keyPEM, csrPEM, nil
+}
+
+// GenerateAndSaveKeyAndCSR generates an ECDSA P-256 key and PKCS#10 CSR, atomically writes the
+// private key PEM to keyOutPath, and enforces private file ACL lockdown via internal/acl.
+func GenerateAndSaveKeyAndCSR(
+	commonName string,
+	ips []string,
+	dnsNames []string,
+	keyOutPath string,
+) (priv *ecdsa.PrivateKey, keyPEM []byte, csrPEM []byte, err error) {
+	trimmedKeyOut := strings.TrimSpace(keyOutPath)
+	if trimmedKeyOut == "" {
+		return nil, nil, nil, errors.New("CSR private key output path cannot be empty")
+	}
+	priv, keyPEM, csrPEM, err = GenerateKeyAndCSR(commonName, ips, dnsNames)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := writeFileAtomic(trimmedKeyOut, keyPEM, 0o600); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to write CSR private key %q: %w", trimmedKeyOut, err)
+	}
+	if err := acl.LockdownPrivateFile(trimmedKeyOut); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to lock down CSR private key %q: %w", trimmedKeyOut, err)
+	}
 	return priv, keyPEM, csrPEM, nil
 }
 

@@ -174,6 +174,18 @@ func (c *Client) Sync(ctx context.Context, req SyncRequest) (*SyncResult, error)
 	return &out, nil
 }
 
+// Renew submits an authenticated tokenless peer certificate rotation request to POST /cluster/v1/renew.
+func (c *Client) Renew(ctx context.Context, req RenewRequest) (*RenewResponse, error) {
+	if c == nil {
+		return nil, errors.New("cluster client is nil")
+	}
+	var out RenewResponse
+	if err := c.doJSON(ctx, http.MethodPost, pathClusterRenew, req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 func (c *Client) doJSON(ctx context.Context, method, path string, reqPayload any, respDst any) error {
 	if ctx == nil {
 		ctx = context.Background()

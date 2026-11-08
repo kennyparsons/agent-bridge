@@ -105,6 +105,7 @@ func runCommandIsolated(
 	defer job.close()
 
 	cmd := exec.CommandContext(ctx, executable, args...)
+	cmd.Env = commandEnv()
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{

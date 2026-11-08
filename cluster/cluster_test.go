@@ -8,14 +8,17 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/kennyparsons/agent-bridge/internal/config"
+	"github.com/kennyparsons/agent-bridge/internal/netbind"
 	"github.com/kennyparsons/agent-bridge/internal/pki"
 	"github.com/kennyparsons/agent-bridge/internal/protocol"
 )
@@ -1805,5 +1808,569 @@ func TestGossipSenderIdentitySpoofingAndReEnrollment(t *testing.T) {
 			n2.engine.Status().AliveNodes == 3 &&
 			n3Rejoined.engine.Status().AliveNodes == 3 &&
 			n2SawNewSerial
+	})
+}
+
+func mustCIDRAddrForTest(t *testing.T, raw string) net.Addr {
+	t.Helper()
+	ip, ipNet, err := net.ParseCIDR(raw)
+	if err != nil {
+		t.Fatalf("ParseCIDR(%s): %v", raw, err)
+	}
+	return &net.IPNet{IP: ip, Mask: ipNet.Mask}
+}
+
+func TestMultiListenerClusterControlPlaneAndStartWithListeners(t *testing.T) {
+	fix := newTestPKIFixture(t)
+	nodeDir := filepath.Join(t.TempDir(), "multi-bind-node")
+	issued, err := pki.IssueCert(pki.IssueCertOptions{
+		CADir:    fix.caDir,
+		OutDir:   nodeDir,
+		Type:     pki.TypePeer,
+		Name:     "multi-bind-node",
+		IPs:      []string{"127.0.0.1"},
+		DNSNames: []string{"localhost"},
+	})
+	if err != nil {
+		t.Fatalf("IssueCert: %v", err)
+	}
+	caPath := filepath.Join(nodeDir, pki.CACertFilename)
+	crlPath := filepath.Join(nodeDir, pki.CRLFilename)
+	statePath := filepath.Join(nodeDir, "cluster-state.json")
+	copyFileForTest(t, fix.caRes.CACertPath, caPath, 0o644)
+	copyFileForTest(t, fix.caRes.CRLPath, crlPath, 0o644)
+
+	caCert, _, err := pki.LoadCACertPool(caPath)
+	if err != nil {
+		t.Fatalf("LoadCACertPool: %v", err)
+	}
+	watcher, err := pki.NewCRLWatcher(crlPath, caCert, nil, nil)
+	if err != nil {
+		t.Fatalf("NewCRLWatcher: %v", err)
+	}
+	t.Cleanup(func() { _ = watcher.Close() })
+
+	ln1, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen(ln1): %v", err)
+	}
+	ln2, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		_ = ln1.Close()
+		t.Fatalf("Listen(ln2): %v", err)
+	}
+
+	eng, err := NewEngine(Config{
+		NodeID:             "multi-bind-node",
+		ClusterBindAddrs:   []string{ln1.Addr().String(), ln2.Addr().String()},
+		CertPath:           issued.CertPath,
+		KeyPath:            issued.KeyPath,
+		CAPath:             caPath,
+		CAKeyPath:          fix.caRes.CAKeyPath,
+		StatePath:          statePath,
+		CRLWatcher:         watcher,
+		GossipInterval:     testGossipInterval,
+		SuspectTimeout:     testSuspectTimeout,
+		UnreachableTimeout: testUnreachableTimeout,
+		Logger:             log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		_ = ln1.Close()
+		_ = ln2.Close()
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := eng.StartWithListeners(ctx, []net.Listener{ln1, ln2}); err != nil {
+		cancel()
+		t.Fatalf("StartWithListeners: %v", err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = eng.Close()
+	})
+	<-eng.Ready()
+
+	bound := eng.BoundAddrs()
+	if len(bound) != 2 || bound[0] != ln1.Addr().String() || bound[1] != ln2.Addr().String() {
+		t.Fatalf("unexpected BoundAddrs(): %v (want [%s %s])", bound, ln1.Addr().String(), ln2.Addr().String())
+	}
+
+	// Verify both listeners serve authenticated mTLS ClusterStatus.
+	for _, targetAddr := range bound {
+		cli, cliErr := NewClient(&config.ResolvedClusterConfig{
+			ClusterAddr: targetAddr,
+			CertPath:    fix.adminCert.CertPath,
+			KeyPath:     fix.adminCert.KeyPath,
+			CAPath:      caPath,
+			Timeout:     5 * time.Second,
+		})
+		if cliErr != nil {
+			t.Fatalf("NewClient(%s): %v", targetAddr, cliErr)
+		}
+		st, stErr := cli.Status(context.Background())
+		_ = cli.Close()
+		if stErr != nil {
+			t.Fatalf("Status(%s): %v", targetAddr, stErr)
+		}
+		if len(st.ClusterBindAddrs) != 2 {
+			t.Fatalf("expected Status().ClusterBindAddrs to expose 2 listeners, got: %v", st.ClusterBindAddrs)
+		}
+	}
+}
+
+func TestMultiSeedBootstrapJoinFallbackAndHairpinSkip(t *testing.T) {
+	fix := newTestPKIFixture(t)
+	seedNode := startPreIssuedTestNode(t, fix, "seed-primary", true, nil)
+
+	tok, _, err := seedNode.engine.CreateJoinToken(5*time.Minute, "fallback-joiner")
+	if err != nil {
+		t.Fatalf("CreateJoinToken: %v", err)
+	}
+
+	// Allocate and immediately close an ephemeral TCP listener to obtain a guaranteed dead port.
+	deadLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen(deadLn): %v", err)
+	}
+	deadAddr := deadLn.Addr().String()
+	_ = deadLn.Close()
+
+	mockProvider := netbind.InterfaceProviderFunc(func() ([]netbind.InterfaceInfo, error) {
+		return []netbind.InterfaceInfo{
+			{
+				Index: 2,
+				Name:  "eth0",
+				Flags: net.FlagUp | net.FlagBroadcast,
+				Addrs: []net.Addr{mustCIDRAddrForTest(t, "192.168.1.20/24")},
+			},
+			{
+				Index: 3,
+				Name:  "tailscale0",
+				Flags: net.FlagUp | net.FlagPointToPoint,
+				Addrs: []net.Addr{mustCIDRAddrForTest(t, "100.64.0.20/10")},
+			},
+		}, nil
+	})
+	mockRoute := func(targetAddr string) (net.IP, error) {
+		if strings.HasPrefix(targetAddr, "192.168.1.") {
+			// Simulate Tailscale --accept-routes hijacking local physical LAN traffic into 100.64.0.0/10!
+			return net.ParseIP("100.64.0.20").To4(), nil
+		}
+		return net.ParseIP("127.0.0.1").To4(), nil
+	}
+
+	joinDir := filepath.Join(t.TempDir(), "fallback-joiner")
+	// 1. Verify hairpinned-only seed fails fast with remediation WITHOUT consuming the single-use token!
+	_, hairpinOnlyErr := BootstrapJoin(context.Background(), BootstrapJoinOptions{
+		JoinAddr:          "192.168.1.50:8444",
+		JoinToken:         tok,
+		NodeID:            "fallback-joiner",
+		ClusterBindAddr:   "127.0.0.1:0",
+		CertPath:          filepath.Join(joinDir, "server.crt"),
+		KeyPath:           filepath.Join(joinDir, "server.key"),
+		CAPath:            filepath.Join(joinDir, "ca.crt"),
+		CRLPath:           filepath.Join(joinDir, "crl.pem"),
+		StatePath:         filepath.Join(joinDir, "cluster-state.json"),
+		InterfaceProvider: mockProvider,
+		RouteSourceIP:     mockRoute,
+	})
+	if hairpinOnlyErr == nil || !strings.Contains(hairpinOnlyErr.Error(), "--accept-routes=false") {
+		t.Fatalf("expected outbound LAN hairpin error mentioning --accept-routes=false, got: %v", hairpinOnlyErr)
+	}
+
+	// 2. Now pass comma-separated seeds: [hairpinned LAN seed, dead seed, live seed] using the SAME single-use token!
+	multiSeedSpec := strings.Join([]string{"192.168.1.50:8444", deadAddr, seedNode.engine.Addr()}, ",")
+	res, err := BootstrapJoin(context.Background(), BootstrapJoinOptions{
+		JoinAddr:          multiSeedSpec,
+		JoinToken:         tok,
+		NodeID:            "fallback-joiner",
+		ClusterBindAddr:   "127.0.0.1:0",
+		CertPath:          filepath.Join(joinDir, "server.crt"),
+		KeyPath:           filepath.Join(joinDir, "server.key"),
+		CAPath:            filepath.Join(joinDir, "ca.crt"),
+		CRLPath:           filepath.Join(joinDir, "crl.pem"),
+		StatePath:         filepath.Join(joinDir, "cluster-state.json"),
+		InterfaceProvider: mockProvider,
+		RouteSourceIP:     mockRoute,
+	})
+	if err != nil {
+		t.Fatalf("BootstrapJoin multi-seed fallback failed: %v", err)
+	}
+	if res.SeedAddr != seedNode.engine.Addr() || len(res.SeedAddrs) != 2 || slices.Contains(res.SeedAddrs, "192.168.1.50:8444") {
+		t.Fatalf("unexpected multi-seed BootstrapJoinResult: %+v", res)
+	}
+
+	// Verify persisted cluster-state.json retained SeedPeers!
+	persisted, err := loadPersistedState(filepath.Join(joinDir, "cluster-state.json"))
+	if err != nil {
+		t.Fatalf("loadPersistedState: %v", err)
+	}
+	if !slices.Contains(persisted.SeedPeers, seedNode.engine.Addr()) {
+		t.Fatalf("expected persisted SeedPeers to contain %s, got %v", seedNode.engine.Addr(), persisted.SeedPeers)
+	}
+}
+
+func TestCollectNodeSANsAndAutoInterfaceSANHarvesting(t *testing.T) {
+	fix := newTestPKIFixture(t)
+	seedNode := startPreIssuedTestNode(t, fix, "san-seed-1", true, nil)
+
+	tok, _, err := seedNode.engine.CreateJoinToken(5*time.Minute, "san-harvest-node")
+	if err != nil {
+		t.Fatalf("CreateJoinToken: %v", err)
+	}
+
+	mockProvider := netbind.InterfaceProviderFunc(func() ([]netbind.InterfaceInfo, error) {
+		return []netbind.InterfaceInfo{
+			{
+				Index: 2,
+				Name:  "eth0",
+				Flags: net.FlagUp | net.FlagBroadcast,
+				Addrs: []net.Addr{
+					mustCIDRAddrForTest(t, "192.168.1.20/24"),
+					mustCIDRAddrForTest(t, "169.254.10.20/16"),
+					mustCIDRAddrForTest(t, "fe80::1/64"),
+				},
+			},
+			{
+				Index: 3,
+				Name:  "tailscale0",
+				Flags: net.FlagUp | net.FlagPointToPoint,
+				Addrs: []net.Addr{
+					mustCIDRAddrForTest(t, "100.64.0.20/10"),
+					mustCIDRAddrForTest(t, "fd7a:115c:a1e0::20/128"),
+				},
+			},
+			{
+				Index: 4,
+				Name:  "docker0",
+				Flags: net.FlagUp | net.FlagBroadcast,
+				Addrs: []net.Addr{
+					mustCIDRAddrForTest(t, "172.17.0.1/16"),
+				},
+			},
+		}, nil
+	})
+
+	ips, dnsNames := CollectNodeSANs(NodeSANOptions{
+		ClusterBindSpecs:  []string{"all:8444"},
+		Hostname:          "win-dc-01.corp.example.test",
+		ExtraIPs:          []string{"198.51.100.25"},
+		ExtraDNSNames:     []string{"edge-node.internal"},
+		AutoInterfaceSANs: true,
+		InterfaceProvider: mockProvider,
+	})
+	for _, wantIP := range []string{"127.0.0.1", "192.168.1.20", "100.64.0.20", "fd7a:115c:a1e0::20", "198.51.100.25"} {
+		if !slices.Contains(ips, wantIP) {
+			t.Fatalf("CollectNodeSANs missing expected IP %q in %v", wantIP, ips)
+		}
+	}
+	for _, unwantedIP := range []string{"172.17.0.1", "169.254.10.20", "fe80::1"} {
+		if slices.Contains(ips, unwantedIP) {
+			t.Fatalf("CollectNodeSANs leaked excluded bridge/link-local IP %q in %v", unwantedIP, ips)
+		}
+	}
+	for _, wantDNS := range []string{"localhost", "win-dc-01.corp.example.test", "win-dc-01", "edge-node.internal"} {
+		if !slices.Contains(dnsNames, wantDNS) {
+			t.Fatalf("CollectNodeSANs missing expected DNS SAN %q in %v", wantDNS, dnsNames)
+		}
+	}
+
+	joinDir := filepath.Join(t.TempDir(), "san-harvest-node")
+	certPath := filepath.Join(joinDir, "server.crt")
+	if _, err := BootstrapJoin(context.Background(), BootstrapJoinOptions{
+		JoinAddr:          seedNode.engine.Addr(),
+		JoinToken:         tok,
+		NodeID:            "san-harvest-node",
+		ClusterBindAddrs:  []string{"127.0.0.1:0"},
+		CertPath:          certPath,
+		KeyPath:           filepath.Join(joinDir, "server.key"),
+		CAPath:            filepath.Join(joinDir, "ca.crt"),
+		CRLPath:           filepath.Join(joinDir, "crl.pem"),
+		StatePath:         filepath.Join(joinDir, "cluster-state.json"),
+		ExtraIPs:          []string{"198.51.100.25"},
+		ExtraDNSNames:     []string{"edge-node.internal"},
+		AutoInterfaceSANs: true,
+		InterfaceProvider: mockProvider,
+	}); err != nil {
+		t.Fatalf("BootstrapJoin(san-harvest-node): %v", err)
+	}
+
+	leafCert, err := pki.LoadCertificate(certPath)
+	if err != nil {
+		t.Fatalf("LoadCertificate: %v", err)
+	}
+	for _, verifyHost := range []string{"127.0.0.1", "192.168.1.20", "100.64.0.20", "fd7a:115c:a1e0::20", "198.51.100.25", "localhost", "edge-node.internal"} {
+		if err := leafCert.VerifyHostname(verifyHost); err != nil {
+			t.Fatalf("issued leaf certificate failed VerifyHostname(%q): %v", verifyHost, err)
+		}
+	}
+	if err := leafCert.VerifyHostname("172.17.0.1"); err == nil {
+		t.Fatal("expected docker0 bridge IP 172.17.0.1 to be excluded from issued leaf SANs")
+	}
+}
+
+func TestValidateAlreadyBootstrappedLeafSerialReplacement(t *testing.T) {
+	fix := newTestPKIFixture(t)
+	seedNode := startPreIssuedTestNode(t, fix, "serial-seed-1", true, nil)
+
+	tok1, _, err := seedNode.engine.CreateJoinToken(5*time.Minute, "rekey-node-2")
+	if err != nil {
+		t.Fatalf("CreateJoinToken(tok1): %v", err)
+	}
+
+	nodeDir := filepath.Join(t.TempDir(), "rekey-node-2")
+	certPath := filepath.Join(nodeDir, "server.crt")
+	keyPath := filepath.Join(nodeDir, "server.key")
+	caPath := filepath.Join(nodeDir, "ca.crt")
+	crlPath := filepath.Join(nodeDir, "crl.pem")
+	statePath := filepath.Join(nodeDir, "cluster-state.json")
+
+	res1, err := BootstrapJoin(context.Background(), BootstrapJoinOptions{
+		JoinAddr:        seedNode.engine.Addr(),
+		JoinToken:       tok1,
+		NodeID:          "rekey-node-2",
+		ClusterBindAddr: "127.0.0.1:0",
+		CertPath:        certPath,
+		KeyPath:         keyPath,
+		CAPath:          caPath,
+		CRLPath:         crlPath,
+		StatePath:       statePath,
+	})
+	if err != nil {
+		t.Fatalf("initial BootstrapJoin: %v", err)
+	}
+
+	// 1. Unchanged leaf serial on disk -> idempotent AlreadyBootstrapped: true even without a token!
+	idemRes, err := BootstrapJoin(context.Background(), BootstrapJoinOptions{
+		JoinAddr:        seedNode.engine.Addr(),
+		NodeID:          "rekey-node-2",
+		ClusterBindAddr: "127.0.0.1:0",
+		CertPath:        certPath,
+		KeyPath:         keyPath,
+		CAPath:          caPath,
+		CRLPath:         crlPath,
+		StatePath:       statePath,
+	})
+	if err != nil || !idemRes.AlreadyBootstrapped {
+		t.Fatalf("expected idempotent AlreadyBootstrapped=true with unchanged cert, got res=%+v err=%v", idemRes, err)
+	}
+
+	// 2. Replace server.crt + server.key on disk with a newly pre-issued peer certificate!
+	replacementIssued, err := pki.IssueCert(pki.IssueCertOptions{
+		CADir:    fix.caDir,
+		OutDir:   filepath.Join(t.TempDir(), "reissued"),
+		Type:     pki.TypePeer,
+		Name:     "rekey-node-2",
+		IPs:      []string{"127.0.0.1", "100.64.0.99"},
+		DNSNames: []string{"localhost"},
+	})
+	if err != nil {
+		t.Fatalf("IssueCert(replacement): %v", err)
+	}
+	copyFileForTest(t, replacementIssued.CertPath, certPath, 0o644)
+	copyFileForTest(t, replacementIssued.KeyPath, keyPath, 0o600)
+
+	// Without a join token -> MUST return an actionable error mentioning serial mismatch and 'agent-bridge cluster rejoin'!
+	_, noTokErr := BootstrapJoin(context.Background(), BootstrapJoinOptions{
+		JoinAddr:        seedNode.engine.Addr(),
+		JoinToken:       "",
+		NodeID:          "rekey-node-2",
+		ClusterBindAddr: "127.0.0.1:0",
+		CertPath:        certPath,
+		KeyPath:         keyPath,
+		CAPath:          caPath,
+		CRLPath:         crlPath,
+		StatePath:       statePath,
+	})
+	if noTokErr == nil || !strings.Contains(noTokErr.Error(), "agent-bridge cluster rejoin") {
+		t.Fatalf("expected actionable serial-mismatch error suggesting 'agent-bridge cluster rejoin', got: %v", noTokErr)
+	}
+
+	// 3. With a fresh join token -> MUST NOT short-circuit to AlreadyBootstrapped: true; must execute Mode B PoP re-keying!
+	tok2, _, err := seedNode.engine.CreateJoinToken(5*time.Minute, "rekey-node-2")
+	if err != nil {
+		t.Fatalf("CreateJoinToken(tok2): %v", err)
+	}
+	res2, err := BootstrapJoin(context.Background(), BootstrapJoinOptions{
+		JoinAddr:        seedNode.engine.Addr(),
+		JoinToken:       tok2,
+		NodeID:          "rekey-node-2",
+		ClusterBindAddr: "127.0.0.1:0",
+		CertPath:        certPath,
+		KeyPath:         keyPath,
+		CAPath:          caPath,
+		CRLPath:         crlPath,
+		StatePath:       statePath,
+	})
+	if err != nil {
+		t.Fatalf("Mode B re-key BootstrapJoin failed: %v", err)
+	}
+	if res2.AlreadyBootstrapped || res2.Mode != "pre-issued" {
+		t.Fatalf("expected Mode B pre-issued re-keying (AlreadyBootstrapped=false), got: %+v", res2)
+	}
+	if strings.EqualFold(res2.CertSerialHex, res1.CertSerialHex) || !strings.EqualFold(res2.CertSerialHex, replacementIssued.SerialHex) {
+		t.Fatalf("unexpected CertSerialHex after Mode B re-keying: got %s, want %s", res2.CertSerialHex, replacementIssued.SerialHex)
+	}
+
+	n2 := startBootstrappedNodeEngine(t, "rekey-node-2", certPath, keyPath, caPath, crlPath, statePath, "", []string{seedNode.engine.Addr()})
+	waitForCondition(t, 3*time.Second, "re-keyed node-2 healthy in 2-node cluster", func() bool {
+		return seedNode.engine.Status().AliveNodes == 2 && n2.engine.Status().AliveNodes == 2
+	})
+}
+
+func TestTokenlessAuthenticatedPeerCertRenewalAndForwarding(t *testing.T) {
+	fix := newTestPKIFixture(t)
+
+	authCA1 := startPreIssuedTestNode(t, fix, "auth-ca-1", true, nil)
+	relayPeer2 := startPreIssuedTestNode(t, fix, "relay-peer-2", false, []string{authCA1.engine.Addr()})
+	workerPeer3 := startPreIssuedTestNode(t, fix, "worker-peer-3", false, []string{authCA1.engine.Addr(), relayPeer2.engine.Addr()})
+
+	waitForCondition(t, 3*time.Second, "3-node mesh converged before renewal", func() bool {
+		return authCA1.engine.Status().AliveNodes == 3 &&
+			relayPeer2.engine.Status().AliveNodes == 3 &&
+			workerPeer3.engine.Status().AliveNodes == 3
+	})
+
+	// 1. Security checks on POST /cluster/v1/renew:
+	// 1a. --type client certificate MUST be rejected with HTTP 403 (ServerAuth EKU required).
+	adminHTTP := newRawMTLSHTTPClientForTest(t, fix.adminCert.CertPath, fix.adminCert.KeyPath, fix.caRes.CACertPath)
+	_, _, dummyCSR, err := pki.GenerateKeyAndCSR("worker-peer-3", []string{"127.0.0.1"}, []string{"localhost"})
+	if err != nil {
+		t.Fatalf("GenerateKeyAndCSR: %v", err)
+	}
+	code, body := doJSONRequestForTest(t, adminHTTP, http.MethodPost, "https://"+authCA1.engine.Addr()+pathClusterRenew, RenewRequest{
+		NodeID:      "worker-peer-3",
+		ClusterAddr: workerPeer3.engine.Addr(),
+		CSRPEM:      string(dummyCSR),
+	})
+	if code != http.StatusForbidden || !strings.Contains(body, "ServerAuth") {
+		t.Fatalf("expected HTTP 403 for --type client cert on %s, got %d: %s", pathClusterRenew, code, body)
+	}
+
+	// 1b. relay-peer-2 attempting to renew worker-peer-3 MUST be rejected with HTTP 403!
+	relayHTTP := newRawMTLSHTTPClientForTest(t, relayPeer2.certPath, relayPeer2.keyPath, fix.caRes.CACertPath)
+	code, body = doJSONRequestForTest(t, relayHTTP, http.MethodPost, "https://"+authCA1.engine.Addr()+pathClusterRenew, RenewRequest{
+		NodeID:      "worker-peer-3",
+		ClusterAddr: workerPeer3.engine.Addr(),
+		CSRPEM:      string(dummyCSR),
+	})
+	if code != http.StatusForbidden {
+		t.Fatalf("expected HTTP 403 when relay-peer-2 attempts to renew worker-peer-3, got %d: %s", code, body)
+	}
+
+	// 2. Stop worker-peer-3, run tokenless Mode A CSR RenewPeerCert via NON-CA relay-peer-2 (exercising /cluster/v1/sign-join forwarding!)
+	//    with ExtraIPs + ExtraDNSNames + RevokeOldSerial: true!
+	oldSerialHex := workerPeer3.certSerial
+	oldSerialBig, err := pki.ParseSerialHex(oldSerialHex)
+	if err != nil {
+		t.Fatalf("ParseSerialHex: %v", err)
+	}
+	if err := workerPeer3.engine.Close(); err != nil {
+		t.Fatalf("workerPeer3.Close: %v", err)
+	}
+
+	renewRes, err := RenewPeerCert(context.Background(), RenewOptions{
+		JoinAddr:        relayPeer2.engine.Addr(), // Non-CA relay peer!
+		NodeID:          "worker-peer-3",
+		ClusterBindAddr: "127.0.0.1:0",
+		CertPath:        workerPeer3.certPath,
+		KeyPath:         workerPeer3.keyPath,
+		CAPath:          workerPeer3.caPath,
+		CRLPath:         workerPeer3.crlPath,
+		StatePath:       workerPeer3.statePath,
+		ExtraIPs:        []string{"100.64.0.33"},
+		ExtraDNSNames:   []string{"worker-3.mesh.internal"},
+		RevokeOldSerial: true,
+	})
+	if err != nil {
+		t.Fatalf("RenewPeerCert(Mode A via non-CA relayPeer2) failed: %v", err)
+	}
+	if renewRes.Mode != "csr-renewed" || !renewRes.OldSerialRevoked || strings.EqualFold(renewRes.CertSerialHex, oldSerialHex) {
+		t.Fatalf("unexpected Mode A RenewResult: %+v", renewRes)
+	}
+
+	// Verify renewed leaf certificate contains the new SANs and old serial was revoked across cluster CRLs!
+	renewedLeaf, err := pki.LoadCertificate(workerPeer3.certPath)
+	if err != nil {
+		t.Fatalf("LoadCertificate(renewed): %v", err)
+	}
+	if err := renewedLeaf.VerifyHostname("100.64.0.33"); err != nil {
+		t.Fatalf("renewed leaf missing ExtraIP 100.64.0.33: %v", err)
+	}
+	if err := renewedLeaf.VerifyHostname("worker-3.mesh.internal"); err != nil {
+		t.Fatalf("renewed leaf missing ExtraDNSName worker-3.mesh.internal: %v", err)
+	}
+	waitForCondition(t, time.Second, "old serial revoked in authCA1 and relayPeer2 CRLs", func() bool {
+		return authCA1.watcher.IsRevoked(oldSerialBig) && relayPeer2.watcher.IsRevoked(oldSerialBig)
+	})
+
+	// Restart worker-peer-3 with its renewed certificate and verify all 3 nodes converge to AliveNodes == 3!
+	workerRestarted := startBootstrappedNodeEngine(
+		t,
+		"worker-peer-3",
+		workerPeer3.certPath,
+		workerPeer3.keyPath,
+		workerPeer3.caPath,
+		workerPeer3.crlPath,
+		workerPeer3.statePath,
+		"",
+		[]string{relayPeer2.engine.Addr()},
+	)
+	waitForCondition(t, 3*time.Second, "restarted worker-peer-3 healthy across 3-node cluster after Mode A renew", func() bool {
+		return authCA1.engine.Status().AliveNodes == 3 &&
+			relayPeer2.engine.Status().AliveNodes == 3 &&
+			workerRestarted.engine.Status().AliveNodes == 3
+	})
+
+	// 3. Also test Mode B pre-issued RenewPeerCert (NewCertPath + NewKeyPath + PoP signature)!
+	preIssuedReplacement, err := pki.IssueCert(pki.IssueCertOptions{
+		CADir:    fix.caDir,
+		OutDir:   filepath.Join(t.TempDir(), "mode-b-renew"),
+		Type:     pki.TypePeer,
+		Name:     "worker-peer-3",
+		IPs:      []string{"127.0.0.1", "100.64.0.44"},
+		DNSNames: []string{"localhost"},
+	})
+	if err != nil {
+		t.Fatalf("IssueCert(mode-b-renew): %v", err)
+	}
+	_ = workerRestarted.engine.Close()
+
+	modeBRes, err := RenewPeerCert(context.Background(), RenewOptions{
+		JoinAddr:        authCA1.engine.Addr(),
+		NodeID:          "worker-peer-3",
+		ClusterBindAddr: "127.0.0.1:0",
+		CertPath:        workerPeer3.certPath,
+		KeyPath:         workerPeer3.keyPath,
+		NewCertPath:     preIssuedReplacement.CertPath,
+		NewKeyPath:      preIssuedReplacement.KeyPath,
+		CAPath:          workerPeer3.caPath,
+		CRLPath:         workerPeer3.crlPath,
+		StatePath:       workerPeer3.statePath,
+		RevokeOldSerial: true,
+	})
+	if err != nil {
+		t.Fatalf("RenewPeerCert(Mode B pre-issued) failed: %v", err)
+	}
+	if modeBRes.Mode != "pre-issued-renewed" || !strings.EqualFold(modeBRes.CertSerialHex, preIssuedReplacement.SerialHex) {
+		t.Fatalf("unexpected Mode B RenewResult: %+v", modeBRes)
+	}
+
+	workerRestartedB := startBootstrappedNodeEngine(
+		t,
+		"worker-peer-3",
+		workerPeer3.certPath,
+		workerPeer3.keyPath,
+		workerPeer3.caPath,
+		workerPeer3.crlPath,
+		workerPeer3.statePath,
+		"",
+		[]string{authCA1.engine.Addr()},
+	)
+	waitForCondition(t, 3*time.Second, "restarted worker-peer-3 healthy across 3-node cluster after Mode B renew", func() bool {
+		return authCA1.engine.Status().AliveNodes == 3 &&
+			relayPeer2.engine.Status().AliveNodes == 3 &&
+			workerRestartedB.engine.Status().AliveNodes == 3
 	})
 }

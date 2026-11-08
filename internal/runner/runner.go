@@ -11,12 +11,17 @@ import (
 	"sync/atomic"
 	"time"
 
+	"os"
 	"os/exec"
 
 	"github.com/kennyparsons/agent-bridge/internal/protocol"
 )
 
 const (
+	// EnvInExec is set to "1" inside every subprocess spawned by Runner so child processes
+	// (such as `agent-bridge upgrade` or `service restart`) can detect in-band execution.
+	EnvInExec = "AGENT_BRIDGE_IN_EXEC"
+
 	// Logical shell identifiers supported by --shell.
 	ShellPowerShell = "powershell"
 	ShellPWSH       = "pwsh"
@@ -416,4 +421,22 @@ func (b *boundedBuffer) String() string {
 
 func (b *boundedBuffer) Exceeded() bool {
 	return b.exceeded.Load()
+}
+
+func commandEnv() []string {
+	return buildCommandEnv(os.Environ())
+}
+
+func buildCommandEnv(base []string) []string {
+	env := make([]string, 0, len(base)+1)
+	for _, kv := range base {
+		if eq := strings.IndexByte(kv, '='); eq > 0 {
+			if strings.EqualFold(kv[:eq], EnvInExec) {
+				continue
+			}
+		}
+		env = append(env, kv)
+	}
+	env = append(env, EnvInExec+"=1")
+	return env
 }

@@ -18,6 +18,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/kennyparsons/agent-bridge/internal/acl"
 )
 
 const (
@@ -99,6 +101,7 @@ type RevokeCertOptions struct {
 	CADir        string
 	Serial       string
 	SerialNumber *big.Int
+	CertPath     string
 	CRLOut       string
 }
 
@@ -245,8 +248,8 @@ func InitCA(opts InitCAOptions) (*InitCAResult, error) {
 		years = DefaultCAYears
 	}
 
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return nil, fmt.Errorf("failed to create CA directory %q: %w", outDir, err)
+	if err := acl.LockdownServerDir(outDir); err != nil {
+		return nil, fmt.Errorf("failed to create and lock down CA directory %q: %w", outDir, err)
 	}
 
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -331,6 +334,9 @@ func InitCA(opts InitCAOptions) (*InitCAResult, error) {
 
 	if err := writeFileAtomic(caKeyPath, caKeyPEM, 0o600); err != nil {
 		return nil, fmt.Errorf("failed to write CA private key: %w", err)
+	}
+	if err := acl.LockdownPrivateFile(caKeyPath); err != nil {
+		return nil, fmt.Errorf("failed to lock down CA private key: %w", err)
 	}
 	if err := writeFileAtomic(caCertPath, caCertPEM, 0o644); err != nil {
 		return nil, fmt.Errorf("failed to write CA certificate: %w", err)
@@ -506,6 +512,9 @@ func IssueCert(opts IssueCertOptions) (*IssueCertResult, error) {
 	if err := writeFileAtomic(keyPath, keyPEM, 0o600); err != nil {
 		return nil, fmt.Errorf("failed to write %s private key: %w", certType, err)
 	}
+	if err := acl.LockdownPrivateFile(keyPath); err != nil {
+		return nil, fmt.Errorf("failed to lock down %s private key: %w", certType, err)
+	}
 	if err := writeFileAtomic(certPath, certPEM, 0o644); err != nil {
 		return nil, fmt.Errorf("failed to write %s certificate: %w", certType, err)
 	}
@@ -545,8 +554,24 @@ func RevokeCert(opts RevokeCertOptions) (*RevokeCertResult, error) {
 		}
 		targetSerial = parsed
 	}
+	if certPath := strings.TrimSpace(opts.CertPath); certPath != "" {
+		cert, err := LoadCertificate(certPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load certificate for revocation: %w", err)
+		}
+		if cert.SerialNumber == nil || cert.SerialNumber.Sign() <= 0 {
+			return nil, fmt.Errorf("certificate %q has invalid non-positive serial number", certPath)
+		}
+		if targetSerial != nil && targetSerial.Cmp(cert.SerialNumber) != 0 {
+			return nil, fmt.Errorf(
+				"conflicting serial numbers: certificate %q has serial %s, does not match %s",
+				certPath, FormatSerialHex(cert.SerialNumber), FormatSerialHex(targetSerial),
+			)
+		}
+		targetSerial = new(big.Int).Set(cert.SerialNumber)
+	}
 	if targetSerial == nil {
-		return nil, errors.New("serial number (--serial) is required")
+		return nil, errors.New("serial number (--serial) or certificate path (--cert) is required")
 	}
 
 	crlOut := strings.TrimSpace(opts.CRLOut)
@@ -871,6 +896,14 @@ func writeFileAtomic(targetPath string, data []byte, perm os.FileMode) error {
 		}
 	}()
 
+	isPrivate := perm&0o077 == 0 || strings.HasSuffix(strings.ToLower(targetPath), ".key")
+	if isPrivate {
+		if err := acl.LockdownPrivateFile(tmpPath); err != nil {
+			_ = tmpFile.Close()
+			return fmt.Errorf("failed to enforce private ACL on temporary file %q: %w", tmpPath, err)
+		}
+	}
+
 	if _, err := tmpFile.Write(data); err != nil {
 		_ = tmpFile.Close()
 		return fmt.Errorf("failed to write temporary file %q: %w", tmpPath, err)
@@ -888,7 +921,13 @@ func writeFileAtomic(targetPath string, data []byte, perm os.FileMode) error {
 	if err := os.Rename(tmpPath, targetPath); err != nil {
 		return fmt.Errorf("failed to atomically rename %q -> %q: %w", tmpPath, targetPath, err)
 	}
-
 	cleanup = false
+
+	if isPrivate {
+		if err := acl.LockdownPrivateFile(targetPath); err != nil {
+			return fmt.Errorf("failed to enforce private ACL on %q: %w", targetPath, err)
+		}
+	}
+
 	return nil
 }
