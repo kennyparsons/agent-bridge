@@ -1,0 +1,346 @@
+name: CI & Release
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Explicit SemVer tag override (e.g. v0.2.0)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  RELEASE_ED25519_PUBKEY_HEX: "66541112f44401142904d2d931e4cd181e8b235d12fe3126a8fe892aa35a6d8f"
+
+jobs:
+  verify:
+    name: Verify (Linux, Cross-Vet & OPSEC)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Structural OPSEC & secret gate
+        run: |
+          set -euo pipefail
+          fail=0
+
+          check_absent() {
+            local desc="$1"
+            local flags="$2"
+            local pattern="$3"
+            local rc=0
+            git grep "$flags" -e "$pattern" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "::error::Tracked file contains forbidden pattern ($desc)"
+              fail=1
+            elif [ "$rc" -ne 1 ]; then
+              echo "::error::git grep failed (exit $rc) while checking: $desc"
+              fail=1
+            fi
+          }
+
+          check_absent "PEM private key header" "-nE" '-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----'
+          check_absent "live-formatted abjt1 join token" "-nE" 'abjt1\.[0-9a-fA-F]{32,}'
+          check_absent "non-100.64.* Tailscale CGNAT IP" "-nE" '(^|[^0-9.])100\.(6[5-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}([^0-9.]|$)'
+          check_absent "workstation or internal domain marker" "-niE" '/usr/local/g[o]ogle|g[l]inux|@g[o]ogle\.|@w[i]z\.'
+
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+          echo "OPSEC & secret gate passed."
+
+      - name: Check formatting (gofmt)
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Static analysis (go vet Linux, Windows, macOS)
+        run: |
+          set -euo pipefail
+          go vet ./...
+          GOOS=windows GOARCH=amd64 go vet ./...
+          GOOS=darwin GOARCH=arm64 go vet ./...
+
+      - name: Unit & race tests (Linux)
+        run: go test -race -count=1 ./...
+
+      - name: Cross-build & verify reproducible unstripped binary metadata
+        run: |
+          set -euo pipefail
+          make build-all VERSION=v0.0.0-ci
+
+          meta="$(go version -m dist/agent-bridge-linux-amd64)"
+          echo "$meta"
+
+          echo "$meta" | grep -q $'build\t-trimpath=true' || {
+            echo "::error::dist/agent-bridge-linux-amd64 missing -trimpath=true"
+            exit 1
+          }
+          echo "$meta" | grep -q $'build\tCGO_ENABLED=0' || {
+            echo "::error::dist/agent-bridge-linux-amd64 missing CGO_ENABLED=0"
+            exit 1
+          }
+          if echo "$meta" | grep -E $'build\t-ldflags=.*(^|[[:space:]])(-s|-w)([[:space:]]|$)'; then
+            echo "::error::dist/agent-bridge-linux-amd64 must remain unstripped (no -s or -w)"
+            exit 1
+          fi
+
+          lines="$(wc -l < dist/SHA256SUMS.txt | tr -d ' ')"
+          if [ "$lines" -ne 4 ]; then
+            echo "::error::Expected 4 entries in dist/SHA256SUMS.txt, got $lines"
+            cat dist/SHA256SUMS.txt
+            exit 1
+          fi
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+
+  verify-windows:
+    name: Verify (Windows Kernel Job Objects & Win32 ACLs)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Unit & race tests (Windows)
+        run: go test -race -count=1 ./...
+
+  release:
+    name: SemVer Tag, Sign & Publish Release
+    runs-on: ubuntu-latest
+    needs:
+      - verify
+      - verify-windows
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout full history & tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Compute next SemVer tag
+        id: semver
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force origin >/dev/null 2>&1 || true
+
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+
+          SEMVER_RE = re.compile(r"^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+          DISPATCH_RE = re.compile(r"^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$")
+          BREAKING_SUBJ_RE = re.compile(r"^[a-zA-Z]+(?:\([^)]+\))?!:")
+          BREAKING_BODY_RE = re.compile(r"^BREAKING[ -]CHANGE:", re.MULTILINE)
+          FEAT_RE = re.compile(r"^feat(?:\([^)]+\))?:")
+          PATCH_RE = re.compile(r"^(?:fix|perf|sec|build)(?:\([^)]+\))?:")
+
+          def git(*args: str) -> str:
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          def emit(should_release: bool, tag: str = "", last_tag: str = "") -> None:
+              out_path = os.environ["GITHUB_OUTPUT"]
+              with open(out_path, "a", encoding="utf-8") as fh:
+                  fh.write(f"should_release={'true' if should_release else 'false'}\n")
+                  fh.write(f"tag={tag}\n")
+                  fh.write(f"last_tag={last_tag}\n")
+              print(f"should_release={should_release} tag={tag!r} last_tag={last_tag!r}")
+
+          all_tags = {}
+          for line in git("tag", "-l").splitlines():
+              m = SEMVER_RE.match(line.strip())
+              if m:
+                  all_tags[line.strip()] = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+          merged_tags = {}
+          for line in git("tag", "--merged", "HEAD").splitlines():
+              t = line.strip()
+              if t in all_tags:
+                  merged_tags[t] = all_tags[t]
+
+          source_tags = merged_tags if merged_tags else all_tags
+          if source_tags:
+              last_tag, last_ver = max(source_tags.items(), key=lambda kv: kv[1])
+          else:
+              last_tag, last_ver = "", (0, 0, 0)
+
+          event_name = os.environ.get("EVENT_NAME", "")
+          dispatch_ver = os.environ.get("INPUT_RELEASE_VERSION", "").strip()
+
+          # 1. Explicit workflow_dispatch release_version override.
+          if event_name == "workflow_dispatch" and dispatch_ver:
+              if not dispatch_ver.startswith("v"):
+                  dispatch_ver = "v" + dispatch_ver
+              if not DISPATCH_RE.match(dispatch_ver):
+                  print(f"::error::Invalid release_version {dispatch_ver!r}; expected vMAJOR.MINOR.PATCH", file=sys.stderr)
+                  sys.exit(1)
+              if dispatch_ver in all_tags:
+                  print(f"::error::Tag {dispatch_ver} already exists", file=sys.stderr)
+                  sys.exit(1)
+              emit(True, dispatch_ver, last_tag)
+              sys.exit(0)
+
+          # Check [skip release] on HEAD (and HEAD^2 if HEAD is a PR merge commit).
+          head_msg = git("log", "-1", "--format=%B", "HEAD")
+          skip_msgs = [head_msg]
+          if subprocess.call(["git", "rev-parse", "-q", "--verify", "HEAD^2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+              skip_msgs.append(git("log", "-1", "--format=%B", "HEAD^2"))
+          if any("[skip release]" in m.lower() for m in skip_msgs):
+              print("Detected [skip release] marker on HEAD; skipping release.")
+              emit(False, "", last_tag)
+              sys.exit(0)
+
+          # 2. VERSION file override if strictly greater than last_tag.
+          if os.path.isfile("VERSION"):
+              with open("VERSION", "r", encoding="utf-8") as vf:
+                  raw_v = vf.read().strip()
+              if raw_v:
+                  if not raw_v.startswith("v"):
+                      raw_v = "v" + raw_v
+                  m = SEMVER_RE.match(raw_v)
+                  if not m:
+                      print(f"::error::Malformed VERSION file content: {raw_v!r}", file=sys.stderr)
+                      sys.exit(1)
+                  file_ver = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                  if file_ver > last_ver and raw_v not in all_tags:
+                      emit(True, raw_v, last_tag)
+                      sys.exit(0)
+
+          # 3. Conventional Commit scan over ${last_tag}..HEAD.
+          rev_range = f"{last_tag}..HEAD" if last_tag else "HEAD"
+          raw_log = subprocess.check_output(
+              ["git", "log", "--format=%H%x1f%s%x1f%b%x1e", rev_range],
+              text=True,
+          )
+          records = [r.strip() for r in raw_log.split("\x1e") if r.strip()]
+          if not records:
+              print(f"No commits in {rev_range}; skipping release.")
+              emit(False, "", last_tag)
+              sys.exit(0)
+
+          has_breaking = False
+          has_feat = False
+          has_patch = False
+
+          for rec in records:
+              parts = rec.split("\x1f")
+              subj = parts[1].strip() if len(parts) > 1 else ""
+              body = parts[2].strip() if len(parts) > 2 else ""
+
+              candidates = [subj]
+              if subj.startswith("Merge pull request #") and body:
+                  first_body_line = body.splitlines()[0].strip()
+                  if first_body_line:
+                      candidates.append(first_body_line)
+
+              if BREAKING_BODY_RE.search(body) or any(BREAKING_SUBJ_RE.match(c) for c in candidates):
+                  has_breaking = True
+              if any(FEAT_RE.match(c) for c in candidates):
+                  has_feat = True
+              if any(PATCH_RE.match(c) for c in candidates):
+                  has_patch = True
+
+          maj, min_, pat = last_ver
+          if has_breaking:
+              next_ver = (maj + 1, 0, 0) if maj >= 1 else (0, min_ + 1, 0)
+          elif has_feat:
+              next_ver = (maj, min_ + 1, 0)
+          elif has_patch:
+              next_ver = (maj, min_, pat + 1)
+          else:
+              print("Only non-releasing commits (ci/docs/test/chore) detected; skipping release.")
+              emit(False, "", last_tag)
+              sys.exit(0)
+
+          next_tag = f"v{next_ver[0]}.{next_ver[1]}.{next_ver[2]}"
+          if next_tag in all_tags:
+              print(f"::error::Computed tag {next_tag} already exists", file=sys.stderr)
+              sys.exit(1)
+          emit(True, next_tag, last_tag)
+          PY
+
+      - name: Build, sign, verify, tag, and publish GitHub Release
+        if: steps.semver.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.semver.outputs.tag }}
+          LAST_TAG: ${{ steps.semver.outputs.last_tag }}
+          RELEASE_ED25519_PRIVATE_KEY: ${{ secrets.RELEASE_ED25519_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" "$GITHUB_SHA" -m "Release $TAG"
+
+          make build-all VERSION="$TAG"
+
+          go run ./cmd/agent-bridge-sign \
+            --in dist/SHA256SUMS.txt \
+            --out dist/SHA256SUMS.txt.sig
+
+          go run ./cmd/agent-bridge-sign \
+            --verify \
+            --in dist/SHA256SUMS.txt \
+            --out dist/SHA256SUMS.txt.sig \
+            --pubkey "$RELEASE_ED25519_PUBKEY_HEX"
+
+          git push origin "refs/tags/$TAG"
+
+          notes_args=(--generate-notes)
+          if [ -n "$LAST_TAG" ]; then
+            notes_args+=(--notes-start-tag "$LAST_TAG")
+          fi
+
+          gh release create "$TAG" \
+            dist/agent-bridge-darwin-arm64 \
+            dist/agent-bridge-linux-amd64 \
+            dist/agent-bridge-linux-arm64 \
+            dist/agent-bridge-windows-amd64.exe \
+            dist/SHA256SUMS.txt \
+            dist/SHA256SUMS.txt.sig \
+            --verify-tag \
+            --title "$TAG" \
+            "${notes_args[@]}"
