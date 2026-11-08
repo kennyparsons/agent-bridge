@@ -42,9 +42,11 @@ func DefaultPathsForOS(goos string) Paths {
 type ServerDaemonConfig struct {
 	BindSpecs        []string `json:"bind_specs,omitempty"`
 	Port             int      `json:"port,omitempty"`
+	ClusterEnabled   bool     `json:"cluster_enabled,omitempty"`
 	ClusterBindSpecs []string `json:"cluster_bind_specs,omitempty"`
 	ClusterAdvertise string   `json:"cluster_advertise,omitempty"`
 	JoinAddr         string   `json:"join_addr,omitempty"`
+	SeedPeers        []string `json:"seed_peers,omitempty"`
 	NodeID           string   `json:"node_id,omitempty"`
 	DataDir          string   `json:"data_dir,omitempty"`
 	CertPath         string   `json:"cert_path,omitempty"`
@@ -54,10 +56,12 @@ type ServerDaemonConfig struct {
 	CRLPath          string   `json:"crl_path,omitempty"`
 	StatePath        string   `json:"state_path,omitempty"`
 	LogPath          string   `json:"log_path,omitempty"`
+	PolicyPath       string   `json:"policy_path,omitempty"`
 	Shell            string   `json:"shell,omitempty"`
 	WaitBind         string   `json:"wait_bind,omitempty"`
 	SANIPs           []string `json:"san_ips,omitempty"`
 	SANDNS           []string `json:"san_dns,omitempty"`
+	NoAutoSANs       bool     `json:"no_auto_sans,omitempty"`
 }
 
 // SaveServerDaemonConfig writes cfg as indented JSON to path (defaulting to DefaultPaths().ConfigPath
