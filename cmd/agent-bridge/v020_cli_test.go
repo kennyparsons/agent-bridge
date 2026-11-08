@@ -366,7 +366,7 @@ func TestV020MultiBindAutoSANsBundleClientInitVerifyHostAndExec(t *testing.T) {
 	if !initOut.Verified || !initOut.Healthy {
 		t.Fatalf("expected client init --verify to report healthy: %+v", initOut)
 	}
-	if st, err := acl.AuditPathACL(filepath.Join(clientCfgDir, pki.ClientKeyFilename), false); err != nil || !st.Secure {
+	if st, err := acl.AuditPathACL(filepath.Join(clientCfgDir, pki.ClientKeyFilename), true); err != nil || !st.Secure {
 		t.Fatalf("expected installed client.key ACL to be locked down: status=%+v err=%v", st, err)
 	}
 
