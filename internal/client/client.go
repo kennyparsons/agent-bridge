@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -266,9 +267,13 @@ func formatTransportError(action, endpoint string, err error, httpResp *http.Res
 	case strings.Contains(lower, "x509:") || strings.Contains(lower, "tls:"):
 		return fmt.Errorf("TLS 1.3 handshake failed while %s %s (verify server SANs cover %s and certificates have not expired): %w", action, endpoint, endpoint, err)
 
-	case strings.Contains(lower, "connection refused") ||
+	case errors.Is(err, syscall.ECONNREFUSED) ||
+		strings.Contains(lower, "connection refused") ||
+		strings.Contains(lower, "actively refused") ||
 		strings.Contains(lower, "no route to host") ||
+		strings.Contains(lower, "unreachable host") ||
 		strings.Contains(lower, "network is unreachable") ||
+		strings.Contains(lower, "unreachable network") ||
 		strings.Contains(lower, "i/o timeout"):
 		return fmt.Errorf("unable to reach agent-bridge daemon while %s %s (verify `agent-bridge server` is running and Tailscale connectivity is active): %w", action, endpoint, err)
 

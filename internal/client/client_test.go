@@ -491,3 +491,17 @@ func TestClientContextCancellationAndUnreachableEndpoint(t *testing.T) {
 		t.Fatalf("expected actionable unreachable daemon error, got: %v", err)
 	}
 }
+
+func TestFormatTransportErrorWindowsWinSockRefused(t *testing.T) {
+	winErr := errors.New("dial tcp 127.0.0.1:8443: connectex: No connection could be made because the target machine actively refused it.")
+	got := formatTransportError("connecting to", "127.0.0.1:8443", winErr, nil)
+	if got == nil {
+		t.Fatal("expected non-nil formatted error")
+	}
+	if !strings.Contains(strings.ToLower(got.Error()), "unable to reach agent-bridge daemon") {
+		t.Fatalf("expected actionable unreachable daemon error for WinSock connectex refusal, got: %v", got)
+	}
+	if !errors.Is(got, winErr) {
+		t.Fatalf("expected wrapped underlying error, got: %v", got)
+	}
+}
