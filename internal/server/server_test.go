@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/kennyparsons/agent-bridge/internal/netbind"
 	"github.com/kennyparsons/agent-bridge/internal/pki"
 	"github.com/kennyparsons/agent-bridge/internal/protocol"
 	"github.com/kennyparsons/agent-bridge/internal/runner"
@@ -1112,4 +1114,275 @@ func waitForPIDFile(t *testing.T, pidFile string, maxWait time.Duration) int {
 	}
 	t.Fatalf("timed out waiting for grandchild PID file %q", pidFile)
 	return 0
+}
+
+type failingAcceptListener struct {
+	addr    net.Addr
+	failCh  chan error
+	closeCh chan struct{}
+	once    sync.Once
+}
+
+func newFailingAcceptListener(addr string) *failingAcceptListener {
+	tcpAddr, _ := net.ResolveTCPAddr("tcp", addr)
+	return &failingAcceptListener{
+		addr:    tcpAddr,
+		failCh:  make(chan error, 1),
+		closeCh: make(chan struct{}),
+	}
+}
+
+func (l *failingAcceptListener) Accept() (net.Conn, error) {
+	select {
+	case err := <-l.failCh:
+		return nil, err
+	case <-l.closeCh:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *failingAcceptListener) Close() error {
+	l.once.Do(func() {
+		close(l.closeCh)
+	})
+	return nil
+}
+
+func (l *failingAcceptListener) Addr() net.Addr {
+	return l.addr
+}
+
+func TestServerMultiListenerServeAndBoundAddrs(t *testing.T) {
+	fix := newTestPKIFixture(t)
+	clientTLS := newMTLSClientTLSConfig(t, fix.caPool, fix.clientCert.CertPath, fix.clientCert.KeyPath)
+
+	srv, err := New(Config{
+		BindSpecs: []string{"127.0.0.1"},
+		Port:      protocol.DefaultPort,
+		CertPath:  fix.serverCert.CertPath,
+		KeyPath:   fix.serverCert.KeyPath,
+		CAPath:    fix.caRes.CACertPath,
+		CRLPath:   fix.caRes.CRLPath,
+		Logger:    log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("server.New failed: %v", err)
+	}
+
+	ln1, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		_ = srv.Close()
+		t.Fatalf("net.Listen #1 failed: %v", err)
+	}
+	ln2, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		_ = ln1.Close()
+		_ = srv.Close()
+		t.Fatalf("net.Listen #2 failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	doneCh := make(chan error, 1)
+	go func() {
+		doneCh <- srv.ServeListeners(ctx, []net.Listener{ln1, ln2})
+	}()
+
+	select {
+	case <-srv.Ready():
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for multi-listener Ready()")
+	}
+
+	bound := srv.BoundAddrs()
+	if len(bound) != 2 {
+		cancel()
+		t.Fatalf("BoundAddrs() len = %d (%v), want 2", len(bound), bound)
+	}
+	if srv.Addr() != bound[0] {
+		cancel()
+		t.Fatalf("Addr() = %q, want BoundAddrs()[0] = %q", srv.Addr(), bound[0])
+	}
+
+	// Execute a command over EACH bound listener to prove both listeners serve mTLS 1.3 traffic.
+	for i, targetAddr := range bound {
+		wsConn, _, dialErr := dialWS(context.Background(), targetAddr, clientTLS)
+		if dialErr != nil {
+			cancel()
+			t.Fatalf("listener #%d (%s) dialWS failed: %v", i, targetAddr, dialErr)
+		}
+		if writeErr := wsConn.WriteJSON(protocol.CommandRequest{
+			Command:        echoTrimTestCommand(),
+			TimeoutSeconds: 10,
+		}); writeErr != nil {
+			_ = wsConn.Close()
+			cancel()
+			t.Fatalf("listener #%d WriteJSON failed: %v", i, writeErr)
+		}
+		_, rawFrame, readErr := wsConn.ReadMessage()
+		_ = wsConn.Close()
+		if readErr != nil {
+			cancel()
+			t.Fatalf("listener #%d ReadMessage failed: %v", i, readErr)
+		}
+		var resp protocol.CommandResponse
+		if unmarshalErr := json.Unmarshal(rawFrame, &resp); unmarshalErr != nil || resp.ExitCode != 0 {
+			cancel()
+			t.Fatalf("listener #%d unexpected response: err=%v resp=%+v", i, unmarshalErr, resp)
+		}
+	}
+
+	cancel()
+	select {
+	case serveErr := <-doneCh:
+		if serveErr != nil {
+			t.Fatalf("ServeListeners returned error on clean shutdown: %v", serveErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for ServeListeners shutdown")
+	}
+}
+
+func TestServerBindSpecsDualStackAndUnexpectedListenerExit(t *testing.T) {
+	fix := newTestPKIFixture(t)
+	clientTLS := newMTLSClientTLSConfig(t, fix.caPool, fix.clientCert.CertPath, fix.clientCert.KeyPath)
+
+	t.Run("BindSpecs 'all' dual-stack ListenAndServe", func(t *testing.T) {
+		probe4, err := net.Listen("tcp4", "0.0.0.0:0")
+		if err != nil {
+			t.Fatalf("probe tcp4 listen failed: %v", err)
+		}
+		freePort := probe4.Addr().(*net.TCPAddr).Port
+		_ = probe4.Close()
+
+		// Ensure tcp6 is also free on that port if IPv6 is enabled.
+		if probe6, err6 := net.Listen("tcp6", net.JoinHostPort("::", strconv.Itoa(freePort))); err6 == nil {
+			_ = probe6.Close()
+		}
+
+		srv, err := New(Config{
+			BindSpecs: []string{"all"},
+			Port:      freePort,
+			CertPath:  fix.serverCert.CertPath,
+			KeyPath:   fix.serverCert.KeyPath,
+			CAPath:    fix.caRes.CACertPath,
+			CRLPath:   fix.caRes.CRLPath,
+			Logger:    log.New(io.Discard, "", 0),
+		})
+		if err != nil {
+			t.Fatalf("New(BindSpecs=['all']) failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		doneCh := make(chan error, 1)
+		go func() {
+			doneCh <- srv.ListenAndServe(ctx)
+		}()
+
+		select {
+		case <-srv.Ready():
+		case err := <-doneCh:
+			t.Fatalf("ListenAndServe(['all']) exited early: %v", err)
+		case <-time.After(3 * time.Second):
+			cancel()
+			t.Fatal("timed out waiting for dual-stack Ready()")
+		}
+
+		if len(srv.BoundAddrs()) < 1 {
+			cancel()
+			t.Fatalf("expected at least 1 bound listener for 'all', got %v", srv.BoundAddrs())
+		}
+
+		loopbackTarget := net.JoinHostPort("127.0.0.1", strconv.Itoa(freePort))
+		wsConn, _, err := dialWS(context.Background(), loopbackTarget, clientTLS)
+		if err != nil {
+			cancel()
+			t.Fatalf("dialWS(%s) against 'all' listener failed: %v", loopbackTarget, err)
+		}
+		_ = wsConn.Close()
+
+		cancel()
+		if err := <-doneCh; err != nil {
+			t.Fatalf("ListenAndServe(['all']) shutdown error: %v", err)
+		}
+	})
+
+	t.Run("WaitBind polls CIDR interface provider and shuts down cleanly on failure", func(t *testing.T) {
+		var calls atomic.Int32
+		emptyProvider := netbind.InterfaceProviderFunc(func() ([]netbind.InterfaceInfo, error) {
+			calls.Add(1)
+			return nil, nil
+		})
+
+		srv, err := New(Config{
+			BindSpecs:         []string{"100.64.0.0/10"},
+			WaitBind:          650 * time.Millisecond,
+			InterfaceProvider: emptyProvider,
+			Port:              18444,
+			CertPath:          fix.serverCert.CertPath,
+			KeyPath:           fix.serverCert.KeyPath,
+			CAPath:            fix.caRes.CACertPath,
+			CRLPath:           fix.caRes.CRLPath,
+			Logger:            log.New(io.Discard, "", 0),
+		})
+		if err != nil {
+			t.Fatalf("New(CIDR + WaitBind) failed: %v", err)
+		}
+
+		err = srv.ListenAndServe(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "timed out") {
+			t.Fatalf("expected WaitBind timeout error, got: %v", err)
+		}
+		if calls.Load() < 2 {
+			t.Fatalf("expected at least 2 interface polls during 650ms WaitBind, got %d", calls.Load())
+		}
+	})
+
+	t.Run("unexpected error on one listener closes sibling listeners cleanly", func(t *testing.T) {
+		srv, err := New(Config{
+			BindSpecs: []string{"127.0.0.1"},
+			Port:      protocol.DefaultPort,
+			CertPath:  fix.serverCert.CertPath,
+			KeyPath:   fix.serverCert.KeyPath,
+			CAPath:    fix.caRes.CACertPath,
+			CRLPath:   fix.caRes.CRLPath,
+			Logger:    log.New(io.Discard, "", 0),
+		})
+		if err != nil {
+			t.Fatalf("New failed: %v", err)
+		}
+
+		healthyLn, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			_ = srv.Close()
+			t.Fatalf("net.Listen failed: %v", err)
+		}
+		failingLn := newFailingAcceptListener("192.0.2.10:38443")
+
+		doneCh := make(chan error, 1)
+		go func() {
+			doneCh <- srv.ServeListeners(context.Background(), []net.Listener{healthyLn, failingLn})
+		}()
+
+		<-srv.Ready()
+
+		boomErr := errors.New("simulated listener hardware fault")
+		failingLn.failCh <- boomErr
+
+		select {
+		case serveErr := <-doneCh:
+			if !errors.Is(serveErr, boomErr) {
+				t.Fatalf("ServeListeners error = %v, want %v", serveErr, boomErr)
+			}
+		case <-time.After(3 * time.Second):
+			_ = srv.Close()
+			t.Fatal("ServeListeners hung in partial-listener zombie state after one listener failed")
+		}
+
+		// Verify healthyLn was also closed automatically.
+		if conn, dialErr := net.DialTimeout("tcp4", healthyLn.Addr().String(), 200*time.Millisecond); dialErr == nil {
+			_ = conn.Close()
+			t.Fatal("expected sibling healthyLn to be closed after failingLn faulted")
+		}
+	})
 }

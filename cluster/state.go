@@ -18,11 +18,28 @@ type persistedClusterState struct {
 	SchemaVersion int                   `json:"schema_version"`
 	Bootstrapped  bool                  `json:"bootstrapped,omitempty"`
 	NodeID        string                `json:"node_id"`
+	CertSerialHex string                `json:"cert_serial_hex,omitempty"`
 	Incarnation   uint64                `json:"incarnation"`
 	JoinedAtUnix  int64                 `json:"joined_at_unix"`
+	SeedPeers     []string              `json:"seed_peers,omitempty"`
 	SignedPolicy  *SignedPolicyEnvelope `json:"signed_policy,omitempty"`
 	Peers         []PeerInfo            `json:"peers,omitempty"`
 	Tokens        []TokenRecord         `json:"tokens,omitempty"`
+}
+
+func persistedSelfSerialHex(st *persistedClusterState, nodeID string) string {
+	if st == nil {
+		return ""
+	}
+	if trimmed := strings.TrimSpace(st.CertSerialHex); trimmed != "" {
+		return trimmed
+	}
+	for _, p := range st.Peers {
+		if p.NodeID == nodeID && strings.TrimSpace(p.CertSerialHex) != "" {
+			return strings.TrimSpace(p.CertSerialHex)
+		}
+	}
+	return ""
 }
 
 // DefaultStatePath derives a cross-platform default cluster state file path inside filepath.Dir(crlPath)

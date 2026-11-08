@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/kennyparsons/agent-bridge/internal/config"
+	"github.com/kennyparsons/agent-bridge/internal/netbind"
 	"github.com/kennyparsons/agent-bridge/internal/pki"
 	"github.com/kennyparsons/agent-bridge/internal/protocol"
 )
@@ -36,21 +37,26 @@ const (
 
 // Config configures a multi-node cluster control-plane Engine instance.
 type Config struct {
-	NodeID             string
-	ClusterBindAddr    string
-	AdvertiseAddr      string
-	ExecAddr           string
-	CertPath           string
-	KeyPath            string
-	CAPath             string
-	CAKeyPath          string
-	StatePath          string
-	SeedPeers          []string
-	CRLWatcher         *pki.CRLWatcher
-	GossipInterval     time.Duration
-	SuspectTimeout     time.Duration
-	UnreachableTimeout time.Duration
-	Logger             *log.Logger
+	NodeID              string
+	ClusterBindAddr     string
+	ClusterBindAddrs    []string
+	ClusterWaitBind     time.Duration
+	ClusterAutoLoopback bool
+	AdvertiseAddr       string
+	ExecAddr            string
+	CertPath            string
+	KeyPath             string
+	CAPath              string
+	CAKeyPath           string
+	StatePath           string
+	SeedPeers           []string
+	CRLWatcher          *pki.CRLWatcher
+	InterfaceProvider   netbind.InterfaceProvider
+	RouteSourceIP       func(seedAddr string) (net.IP, error)
+	GossipInterval      time.Duration
+	SuspectTimeout      time.Duration
+	UnreachableTimeout  time.Duration
+	Logger              *log.Logger
 }
 
 // Engine implements the pure-Go TLS 1.3 TCP gossip mesh, topology-aware dynamic quorum/leadership
@@ -78,7 +84,7 @@ type Engine struct {
 	httpServer      *http.Server
 
 	addrMu            sync.RWMutex
-	boundAddr         string
+	boundAddrs        []string
 	advertisedAddr    string
 	explicitAdvertise bool
 	execAddr          string
@@ -123,31 +129,53 @@ type Engine struct {
 // persisted cluster state from disk, attaches a hot-reload CRL broadcast listener, and prepares
 // the TLS 1.3 control-plane HTTP server and peer mTLS transport.
 func NewEngine(cfg Config) (*Engine, error) {
-	rawBind := strings.TrimSpace(cfg.ClusterBindAddr)
-	if rawBind == "" {
-		return nil, errors.New("cluster bind address (ClusterBindAddr) is required")
+	if cfg.ClusterWaitBind < 0 {
+		return nil, fmt.Errorf("invalid ClusterWaitBind duration %s: must be non-negative", cfg.ClusterWaitBind)
 	}
-	normBind, err := normalizeBindOrAdvertiseAddr(rawBind, config.DefaultClusterPort, true)
+
+	bindSpecs := netbind.SplitTokens(cfg.ClusterBindAddrs)
+	if len(bindSpecs) == 0 && strings.TrimSpace(cfg.ClusterBindAddr) != "" {
+		bindSpecs = netbind.SplitTokens([]string{cfg.ClusterBindAddr})
+	}
+	if len(bindSpecs) == 0 {
+		return nil, errors.New("cluster bind address (ClusterBindAddr / ClusterBindAddrs) is required")
+	}
+	selectors, err := netbind.ParseSpecs(bindSpecs, config.DefaultClusterPort, true)
 	if err != nil {
-		return nil, fmt.Errorf("invalid ClusterBindAddr %q: %w", cfg.ClusterBindAddr, err)
+		return nil, fmt.Errorf("invalid cluster bind address: %w", err)
 	}
-	cfg.ClusterBindAddr = normBind
+	cfg.ClusterBindAddrs = bindSpecs
+	cfg.ClusterBindAddr = bindSpecs[0]
+
+	seedAddrs, err := ParseSeedAddrs(cfg.SeedPeers...)
+	if err != nil {
+		return nil, err
+	}
+
+	initialBoundAddrs := initialClusterBoundAddrs(selectors)
 
 	explicitAdvertise := strings.TrimSpace(cfg.AdvertiseAddr) != ""
-	var advertisedAddr string
-	if explicitAdvertise {
-		normAdv, advErr := normalizeBindOrAdvertiseAddr(cfg.AdvertiseAddr, config.DefaultClusterPort, true)
-		if advErr != nil {
-			return nil, fmt.Errorf("invalid AdvertiseAddr %q: %w", cfg.AdvertiseAddr, advErr)
-		}
-		advertisedAddr = normAdv
-	} else {
-		advertisedAddr = resolveAdvertisedFromBind(normBind)
+	advertisedAddr, err := resolveCanonicalEndpoint(
+		cfg.AdvertiseAddr,
+		bindSpecs,
+		config.DefaultClusterPort,
+		seedAddrs,
+		cfg.InterfaceProvider,
+		cfg.RouteSourceIP,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("invalid AdvertiseAddr %q: %w", cfg.AdvertiseAddr, err)
 	}
 
 	var execAddr string
 	if strings.TrimSpace(cfg.ExecAddr) != "" {
-		normExec, execErr := normalizeBindOrAdvertiseAddr(cfg.ExecAddr, protocol.DefaultPort, true)
+		normExec, execErr := resolveExecEndpoint(
+			cfg.ExecAddr,
+			protocol.DefaultPort,
+			seedAddrs,
+			cfg.InterfaceProvider,
+			cfg.RouteSourceIP,
+		)
 		if execErr != nil {
 			return nil, fmt.Errorf("invalid ExecAddr %q: %w", cfg.ExecAddr, execErr)
 		}
@@ -270,25 +298,6 @@ func NewEngine(cfg Config) (*Engine, error) {
 	}
 	cfg.StatePath = statePath
 
-	var seedAddrs []string
-	seedSeen := make(map[string]struct{})
-	for _, rawSeed := range cfg.SeedPeers {
-		for _, tok := range strings.Split(rawSeed, ",") {
-			trimmed := strings.TrimSpace(tok)
-			if trimmed == "" {
-				continue
-			}
-			normSeed, _, seedErr := config.NormalizeClusterAddr(trimmed)
-			if seedErr != nil {
-				return nil, fmt.Errorf("invalid seed peer address %q: %w", trimmed, seedErr)
-			}
-			if _, exists := seedSeen[normSeed]; !exists {
-				seedSeen[normSeed] = struct{}{}
-				seedAddrs = append(seedAddrs, normSeed)
-			}
-		}
-	}
-
 	rootCtx, cancelRoot := context.WithCancel(context.Background())
 
 	eng := &Engine{
@@ -306,7 +315,7 @@ func NewEngine(cfg Config) (*Engine, error) {
 		nodeCert:            leafCert,
 		nodeKey:             nodeKey,
 		crlWatcher:          cfg.CRLWatcher,
-		boundAddr:           cfg.ClusterBindAddr,
+		boundAddrs:          initialBoundAddrs,
 		advertisedAddr:      advertisedAddr,
 		explicitAdvertise:   explicitAdvertise,
 		execAddr:            execAddr,
@@ -339,6 +348,11 @@ func NewEngine(cfg Config) (*Engine, error) {
 		}
 		if persisted.JoinedAtUnix > 0 {
 			eng.selfJoinedAt = persisted.JoinedAtUnix
+		}
+		if len(persisted.SeedPeers) > 0 {
+			if persistedSeeds, seedErr := ParseSeedAddrs(persisted.SeedPeers...); seedErr == nil {
+				eng.seedAddrs = mergeUniqueStrings(eng.seedAddrs, persistedSeeds)
+			}
 		}
 		if persisted.SignedPolicy != nil {
 			if verifyErr := persisted.SignedPolicy.Verify(caCert, caPool, cfg.CRLWatcher); verifyErr == nil {
@@ -432,6 +446,7 @@ func NewEngine(cfg Config) (*Engine, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(pathClusterJoin, eng.handleJoin)
+	mux.HandleFunc(pathClusterRenew, eng.requirePeerMTLS(eng.handleRenew))
 	mux.HandleFunc(pathClusterSignJoin, eng.requirePeerMTLS(eng.handleSignJoin))
 	mux.HandleFunc(pathClusterSyncPush, eng.requirePeerMTLS(eng.handleSyncPush))
 	mux.HandleFunc(pathClusterSyncPull, eng.requirePeerMTLS(eng.handleSyncPull))
@@ -452,9 +467,9 @@ func NewEngine(cfg Config) (*Engine, error) {
 	return eng, nil
 }
 
-// Start binds the cluster TLS 1.3 TCP listener synchronously (updating Addr() and closing Ready())
-// and launches the background control-plane HTTP server and SWIM/anti-entropy gossip loops.
-// Canceling ctx triggers graceful shutdown via Close().
+// Start binds all configured cluster TLS 1.3 TCP listeners (supporting multi-IP, dual-stack wildcards,
+// CIDR subnet selectors, WaitBind boot polling, and optional auto-loopback) and launches the background
+// control-plane HTTP server and SWIM/anti-entropy gossip loops.
 func (e *Engine) Start(ctx context.Context) error {
 	if e == nil {
 		return errors.New("cluster engine is nil")
@@ -469,17 +484,68 @@ func (e *Engine) Start(ctx context.Context) error {
 		return errors.New("cluster engine is already started")
 	}
 
-	ln, err := net.Listen("tcp", e.cfg.ClusterBindAddr)
+	listeners, err := netbind.WaitAndBindWithOptions(ctx, netbind.BindOptions{
+		Specs:             e.cfg.ClusterBindAddrs,
+		DefaultPort:       config.DefaultClusterPort,
+		AllowPortOverride: true,
+		WaitTimeout:       e.cfg.ClusterWaitBind,
+		AutoLoopback:      e.cfg.ClusterAutoLoopback,
+		InterfaceProvider: e.cfg.InterfaceProvider,
+	})
 	if err != nil {
 		e.started.Store(false)
-		return fmt.Errorf("failed to bind cluster listener on %s: %w", e.cfg.ClusterBindAddr, err)
+		return fmt.Errorf("failed to bind cluster listener(s): %w", err)
 	}
 
-	actualBound := ln.Addr().String()
+	return e.startWithBoundListeners(ctx, listeners)
+}
+
+// StartWithListeners wraps pre-bound TCP listeners with TLS 1.3 and starts the cluster HTTP control plane
+// and background SWIM/anti-entropy gossip loops.
+func (e *Engine) StartWithListeners(ctx context.Context, listeners []net.Listener) error {
+	if e == nil {
+		return errors.New("cluster engine is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(listeners) == 0 {
+		return errors.New("at least one cluster listener is required")
+	}
+	for _, ln := range listeners {
+		if ln == nil {
+			_ = netbind.CloseListeners(listeners)
+			return errors.New("cluster listener cannot be nil")
+		}
+	}
+	if e.closed.Load() {
+		_ = netbind.CloseListeners(listeners)
+		return errors.New("cluster engine is already closed")
+	}
+	if !e.started.CompareAndSwap(false, true) {
+		_ = netbind.CloseListeners(listeners)
+		return errors.New("cluster engine is already started")
+	}
+
+	return e.startWithBoundListeners(ctx, listeners)
+}
+
+func (e *Engine) startWithBoundListeners(ctx context.Context, listeners []net.Listener) error {
+	actualBound := netbind.ListenerAddrs(listeners)
 	e.addrMu.Lock()
-	e.boundAddr = actualBound
+	e.boundAddrs = actualBound
 	if !e.explicitAdvertise || !hasDialablePort(e.advertisedAddr) {
-		e.advertisedAddr = resolveAdvertisedFromBind(actualBound)
+		if resolvedAdv, advErr := netbind.SelectCanonicalAdvertiseAddr(netbind.AdvertiseOptions{
+			BoundAddrs:        actualBound,
+			DefaultPort:       config.DefaultClusterPort,
+			SeedAddrs:         e.seedAddrs,
+			InterfaceProvider: e.cfg.InterfaceProvider,
+			RouteSourceIP:     e.cfg.RouteSourceIP,
+		}); advErr == nil && resolvedAdv != "" {
+			e.advertisedAddr = resolvedAdv
+		} else if len(actualBound) > 0 {
+			e.advertisedAddr = resolveAdvertisedFromBind(actualBound[0])
+		}
 	}
 	advAddr := e.advertisedAddr
 	e.addrMu.Unlock()
@@ -496,7 +562,10 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.mu.Unlock()
 	_ = e.writePersistedSnapshot(persistSnap, persistSeq)
 
-	tlsLn := tls.NewListener(ln, e.serverTLSConfig.Clone())
+	tlsListeners := make([]net.Listener, 0, len(listeners))
+	for _, ln := range listeners {
+		tlsListeners = append(tlsListeners, tls.NewListener(ln, e.serverTLSConfig.Clone()))
+	}
 
 	e.readyOnce.Do(func() {
 		close(e.readyCh)
@@ -512,19 +581,33 @@ func (e *Engine) Start(ctx context.Context) error {
 		}
 	}()
 
-	// Serve HTTPS/mTLS 1.3 cluster API.
+	// Serve HTTPS/mTLS 1.3 cluster API across all bound listeners.
 	if e.trackBgStart() {
 		go func() {
 			defer e.bgWG.Done()
 			defer close(e.doneCh)
-			if serveErr := e.httpServer.Serve(tlsLn); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-				if !e.closed.Load() {
-					e.logf("cluster HTTPS server stopped with error: %v", serveErr)
-				}
+
+			var serveWG sync.WaitGroup
+			for _, tlsLn := range tlsListeners {
+				serveWG.Add(1)
+				go func(l net.Listener) {
+					defer serveWG.Done()
+					if serveErr := e.httpServer.Serve(l); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+						if !e.closed.Load() {
+							e.logf("cluster HTTPS listener %s stopped with error: %v", l.Addr(), serveErr)
+							_ = e.Close()
+						}
+						return
+					}
+					if !e.closed.Load() {
+						_ = e.Close()
+					}
+				}(tlsLn)
 			}
+			serveWG.Wait()
 		}()
 	} else {
-		_ = tlsLn.Close()
+		_ = netbind.CloseListeners(tlsListeners)
 		close(e.doneCh)
 	}
 
@@ -536,7 +619,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	return nil
 }
 
-// Ready returns a channel closed as soon as Start has bound the cluster TLS 1.3 TCP listener.
+// Ready returns a channel closed as soon as Start has bound the cluster TLS 1.3 TCP listener(s).
 func (e *Engine) Ready() <-chan struct{} {
 	if e == nil {
 		ch := make(chan struct{})
@@ -546,14 +629,29 @@ func (e *Engine) Ready() <-chan struct{} {
 	return e.readyCh
 }
 
-// Addr returns the cluster listener's bound "ip:port" address.
+// Addr returns the primary cluster listener's bound "ip:port" address.
 func (e *Engine) Addr() string {
 	if e == nil {
 		return ""
 	}
 	e.addrMu.RLock()
 	defer e.addrMu.RUnlock()
-	return e.boundAddr
+	if len(e.boundAddrs) == 0 {
+		return ""
+	}
+	return e.boundAddrs[0]
+}
+
+// BoundAddrs returns all active bound "ip:port" cluster control-plane listener addresses.
+func (e *Engine) BoundAddrs() []string {
+	if e == nil {
+		return nil
+	}
+	e.addrMu.RLock()
+	defer e.addrMu.RUnlock()
+	out := make([]string, len(e.boundAddrs))
+	copy(out, e.boundAddrs)
+	return out
 }
 
 // Wait blocks until the cluster HTTP server exits (via Close or parent context cancellation).
@@ -652,23 +750,24 @@ func (e *Engine) Status() ClusterStatus {
 	pol := e.ExecutionPolicy()
 
 	return ClusterStatus{
-		NodeID:         e.nodeID,
-		ClusterAddr:    e.currentAdvertisedAddr(),
-		ExecAddr:       e.execAddr,
-		Topology:       eval.Topology,
-		QuorumState:    eval.QuorumState,
-		HasQuorum:      eval.HasQuorum,
-		TotalNodes:     eval.TotalNodes,
-		AliveNodes:     eval.AliveNodes,
-		QuorumRequired: eval.QuorumRequired,
-		LeaderID:       eval.LeaderID,
-		LeaderAddr:     eval.LeaderAddr,
-		IsLeader:       eval.IsLeader,
-		HasCAKey:       e.hasCAKey,
-		CRLNumber:      crlNumStr,
-		RevokedCerts:   revokedCount,
-		Policy:         pol,
-		Peers:          eval.Peers,
+		NodeID:           e.nodeID,
+		ClusterAddr:      e.currentAdvertisedAddr(),
+		ClusterBindAddrs: e.BoundAddrs(),
+		ExecAddr:         e.execAddr,
+		Topology:         eval.Topology,
+		QuorumState:      eval.QuorumState,
+		HasQuorum:        eval.HasQuorum,
+		TotalNodes:       eval.TotalNodes,
+		AliveNodes:       eval.AliveNodes,
+		QuorumRequired:   eval.QuorumRequired,
+		LeaderID:         eval.LeaderID,
+		LeaderAddr:       eval.LeaderAddr,
+		IsLeader:         eval.IsLeader,
+		HasCAKey:         e.hasCAKey,
+		CRLNumber:        crlNumStr,
+		RevokedCerts:     revokedCount,
+		Policy:           pol,
+		Peers:            eval.Peers,
 	}
 }
 
@@ -1190,8 +1289,10 @@ func (e *Engine) buildPersistedSnapshotLocked() (*persistedClusterState, uint64)
 		SchemaVersion: currentStateSchemaVersion,
 		Bootstrapped:  true,
 		NodeID:        e.nodeID,
+		CertSerialHex: pki.FormatSerialHex(e.nodeCert.SerialNumber),
 		Incarnation:   e.selfIncarnation,
 		JoinedAtUnix:  e.selfJoinedAt,
+		SeedPeers:     append([]string(nil), e.seedAddrs...),
 		SignedPolicy:  e.signedPolicy.Clone(),
 		Peers:         peers,
 		Tokens:        tokens,
@@ -1257,6 +1358,52 @@ func (e *Engine) logf(format string, args ...any) {
 	if e != nil && e.logger != nil {
 		e.logger.Printf(format, args...)
 	}
+}
+
+func initialClusterBoundAddrs(selectors []netbind.Selector) []string {
+	addrs := make([]string, 0, len(selectors))
+	for _, sel := range selectors {
+		portStr := strconv.Itoa(sel.Port)
+		switch sel.Kind {
+		case netbind.SelectorDualWildcard:
+			addrs = append(addrs, net.JoinHostPort("0.0.0.0", portStr), net.JoinHostPort("::", portStr))
+		case netbind.SelectorIPv4Wildcard:
+			addrs = append(addrs, net.JoinHostPort("0.0.0.0", portStr))
+		case netbind.SelectorIPv6Wildcard:
+			addrs = append(addrs, net.JoinHostPort("::", portStr))
+		case netbind.SelectorIP:
+			addrs = append(addrs, net.JoinHostPort(sel.IP.String(), portStr))
+		case netbind.SelectorCIDR:
+			addrs = append(addrs, fmt.Sprintf("%s:%s", sel.CIDR.String(), portStr))
+		}
+	}
+	return addrs
+}
+
+func mergeUniqueStrings(primary, extra []string) []string {
+	seen := make(map[string]struct{}, len(primary)+len(extra))
+	out := make([]string, 0, len(primary)+len(extra))
+	for _, s := range primary {
+		trimmed := strings.TrimSpace(s)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; !ok {
+			seen[trimmed] = struct{}{}
+			out = append(out, trimmed)
+		}
+	}
+	for _, s := range extra {
+		trimmed := strings.TrimSpace(s)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; !ok {
+			seen[trimmed] = struct{}{}
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 func resolveAdvertisedFromBind(bindAddr string) string {

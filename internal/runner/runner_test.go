@@ -258,6 +258,30 @@ func TestRunWithPolicyShellPrecedenceAndTimeoutBounds(t *testing.T) {
 	})
 }
 
+func TestRunInjectsInExecEnvironmentMarker(t *testing.T) {
+	gotEnv := buildCommandEnv([]string{"PATH=/usr/bin", "AGENT_BRIDGE_IN_EXEC=0", "agent_bridge_in_exec=stale", "FOO=bar"})
+	wantEnv := []string{"PATH=/usr/bin", "FOO=bar", "AGENT_BRIDGE_IN_EXEC=1"}
+	if !reflect.DeepEqual(gotEnv, wantEnv) {
+		t.Fatalf("buildCommandEnv() = %#v, want %#v", gotEnv, wantEnv)
+	}
+
+	t.Setenv("AGENT_BRIDGE_PARENT_VAR", "kept-intact")
+	t.Setenv(EnvInExec, "0")
+
+	cmdStr := `printf '%s:%s' "$AGENT_BRIDGE_IN_EXEC" "$AGENT_BRIDGE_PARENT_VAR"`
+	if runtime.GOOS == "windows" {
+		cmdStr = `Write-Output "${env:AGENT_BRIDGE_IN_EXEC}:${env:AGENT_BRIDGE_PARENT_VAR}"`
+	}
+
+	resp := Run(context.Background(), protocol.CommandRequest{Command: cmdStr, TimeoutSeconds: 10}, "")
+	if resp.ExitCode != 0 {
+		t.Fatalf("Run failed with ExitCode=%d Stderr=%q", resp.ExitCode, resp.Stderr)
+	}
+	if resp.Stdout != "1:kept-intact" {
+		t.Fatalf("Run stdout = %q, want %q", resp.Stdout, "1:kept-intact")
+	}
+}
+
 func bytesRepeat(b byte, n int) []byte {
 	out := make([]byte, n)
 	for i := range out {
