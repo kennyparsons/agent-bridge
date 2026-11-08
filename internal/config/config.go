@@ -162,6 +162,8 @@ type ResolveOptions struct {
 	HomeDir          string
 	GOOS             string
 	EnvLookup        func(key string) (string, bool)
+	ServerConfigPath string
+	ServerDataDir    string
 }
 
 // Resolve loads and merges client configuration using real OS working directory, home directory,
@@ -210,6 +212,7 @@ func mergeHostConfigs(globalCfg, localCfg *FileConfig) map[string]HostConfig {
 
 type loadedLayers struct {
 	envLookup     func(string) (string, bool)
+	goos          string
 	workDir       string
 	homeDir       string
 	globalCfgPath string
@@ -282,6 +285,7 @@ func loadConfigLayers(opts ResolveOptions) (*loadedLayers, error) {
 
 	return &loadedLayers{
 		envLookup:     envLookup,
+		goos:          goos,
 		workDir:       workDir,
 		homeDir:       homeDir,
 		globalCfgPath: globalCfgPath,
@@ -819,6 +823,27 @@ func ResolveClusterConfigWithOptions(flags ClusterFlagOverrides, opts ResolveOpt
 			} else if layers.globalCfg != nil && strings.TrimSpace(layers.globalCfg.ClusterEndpoint) != "" {
 				rawClusterAddr = strings.TrimSpace(layers.globalCfg.ClusterEndpoint)
 			}
+		}
+	}
+
+	// Server-local fallback: when no client config.json or local agent-bridge.json exists
+	// (e.g. an administrator runs `agent-bridge cluster status` directly on a server node),
+	// automatically inspect server.json and the OS default server DataDir.
+	if layers.globalCfg == nil && layers.localCfg == nil &&
+		(strings.TrimSpace(opts.GlobalConfigPath) == "" ||
+			strings.TrimSpace(opts.ServerConfigPath) != "" ||
+			strings.TrimSpace(opts.ServerDataDir) != "") {
+		srvFallback := resolveServerLocalClusterFallback(opts, layers.goos, layers.homeDir)
+		if rawClusterAddr == "" && srvFallback.clusterAddr != "" {
+			rawClusterAddr = srvFallback.clusterAddr
+		}
+		if strings.TrimSpace(certSrc.raw) == "" && strings.TrimSpace(keySrc.raw) == "" &&
+			srvFallback.certPath != "" && srvFallback.keyPath != "" {
+			certSrc = sourcedPath{raw: srvFallback.certPath}
+			keySrc = sourcedPath{raw: srvFallback.keyPath}
+		}
+		if strings.TrimSpace(caSrc.raw) == "" && srvFallback.caPath != "" {
+			caSrc = sourcedPath{raw: srvFallback.caPath}
 		}
 	}
 

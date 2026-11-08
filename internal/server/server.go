@@ -20,6 +20,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/kennyparsons/agent-bridge/internal/netbind"
 	"github.com/kennyparsons/agent-bridge/internal/pki"
 	"github.com/kennyparsons/agent-bridge/internal/protocol"
 	"github.com/kennyparsons/agent-bridge/internal/runner"
@@ -47,17 +48,20 @@ type PolicyProvider interface {
 // Config defines the network binding, PKI assets, CRL path, optional shared cluster hooks,
 // and execution shell for the daemon.
 type Config struct {
-	BindIP         string
-	Port           int
-	CertPath       string
-	KeyPath        string
-	CAPath         string
-	CRLPath        string
-	CRLWatcher     *pki.CRLWatcher
-	PolicyProvider PolicyProvider
-	Shell          string
-	ShellExplicit  bool
-	Logger         *log.Logger
+	BindIP            string
+	BindSpecs         []string
+	WaitBind          time.Duration
+	InterfaceProvider netbind.InterfaceProvider
+	Port              int
+	CertPath          string
+	KeyPath           string
+	CAPath            string
+	CRLPath           string
+	CRLWatcher        *pki.CRLWatcher
+	PolicyProvider    PolicyProvider
+	Shell             string
+	ShellExplicit     bool
+	Logger            *log.Logger
 }
 
 // Server implements the mTLS 1.3 + hot-reloading CRL + transactional WebSocket command daemon.
@@ -72,10 +76,10 @@ type Server struct {
 	httpServer     *http.Server
 	upgrader       websocket.Upgrader
 
-	addrMu    sync.RWMutex
-	boundAddr string
-	readyOnce sync.Once
-	readyCh   chan struct{}
+	addrMu     sync.RWMutex
+	boundAddrs []string
+	readyOnce  sync.Once
+	readyCh    chan struct{}
 
 	execRootCtx    context.Context
 	cancelExecRoot context.CancelFunc
@@ -92,22 +96,36 @@ type Server struct {
 // initializes and verifies the hot-reloading CRL watcher (failing fast before any socket opens
 // if crl.pem is missing, malformed, expired, or forged).
 func New(cfg Config) (*Server, error) {
-	bindIP := strings.TrimSpace(cfg.BindIP)
-	if bindIP == "" {
-		return nil, errors.New("server bind IP (--bind) is required")
-	}
-	parsedIP := net.ParseIP(bindIP)
-	if parsedIP == nil {
-		return nil, fmt.Errorf("invalid server bind IP address %q", bindIP)
-	}
-	cfg.BindIP = bindIP
-
 	if cfg.Port == 0 {
 		cfg.Port = protocol.DefaultPort
 	}
 	if cfg.Port < 1 || cfg.Port > 65535 {
 		return nil, fmt.Errorf("invalid server port %d: must be between 1 and 65535", cfg.Port)
 	}
+	if cfg.WaitBind < 0 {
+		return nil, fmt.Errorf("invalid server wait-bind duration %s: must be non-negative", cfg.WaitBind)
+	}
+
+	bindIP := strings.TrimSpace(cfg.BindIP)
+	specs := netbind.SplitTokens(cfg.BindSpecs)
+	if len(specs) == 0 && bindIP != "" {
+		specs = netbind.SplitTokens([]string{bindIP})
+	}
+	if len(specs) == 0 {
+		return nil, errors.New("server bind address (--bind) is required")
+	}
+	selectors, err := netbind.ParseSpecs(specs, cfg.Port, false)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server bind address: %w", err)
+	}
+	cfg.BindSpecs = specs
+	if bindIP == "" {
+		cfg.BindIP = specs[0]
+	} else {
+		cfg.BindIP = bindIP
+	}
+
+	initialAddrs := initialConfiguredAddrs(selectors)
 
 	cfg.CertPath = strings.TrimSpace(cfg.CertPath)
 	if cfg.CertPath == "" {
@@ -159,7 +177,7 @@ func New(cfg Config) (*Server, error) {
 		logger:         logger,
 		caCert:         caCert,
 		caPool:         caPool,
-		boundAddr:      net.JoinHostPort(cfg.BindIP, strconv.Itoa(cfg.Port)),
+		boundAddrs:     initialAddrs,
 		readyCh:        make(chan struct{}),
 		execRootCtx:    execRootCtx,
 		cancelExecRoot: cancelExecRoot,
@@ -224,17 +242,52 @@ func New(cfg Config) (*Server, error) {
 	return srv, nil
 }
 
-// Addr returns the listener's bound "ip:port" address (or the configured bind address prior to Serve).
+func initialConfiguredAddrs(selectors []netbind.Selector) []string {
+	addrs := make([]string, 0, len(selectors))
+	for _, sel := range selectors {
+		portStr := strconv.Itoa(sel.Port)
+		switch sel.Kind {
+		case netbind.SelectorDualWildcard:
+			addrs = append(addrs, net.JoinHostPort("0.0.0.0", portStr), net.JoinHostPort("::", portStr))
+		case netbind.SelectorIPv4Wildcard:
+			addrs = append(addrs, net.JoinHostPort("0.0.0.0", portStr))
+		case netbind.SelectorIPv6Wildcard:
+			addrs = append(addrs, net.JoinHostPort("::", portStr))
+		case netbind.SelectorIP:
+			addrs = append(addrs, net.JoinHostPort(sel.IP.String(), portStr))
+		case netbind.SelectorCIDR:
+			addrs = append(addrs, fmt.Sprintf("%s:%s", sel.CIDR.String(), portStr))
+		}
+	}
+	return addrs
+}
+
+// Addr returns the primary listener's bound "ip:port" address (or the first configured bind address prior to Serve).
 func (s *Server) Addr() string {
 	if s == nil {
 		return ""
 	}
 	s.addrMu.RLock()
 	defer s.addrMu.RUnlock()
-	return s.boundAddr
+	if len(s.boundAddrs) == 0 {
+		return ""
+	}
+	return s.boundAddrs[0]
 }
 
-// Ready returns a channel that is closed once the server has bound its TCP listener and started serving.
+// BoundAddrs returns all active bound "ip:port" listener addresses (or the configured bind addresses prior to Serve).
+func (s *Server) BoundAddrs() []string {
+	if s == nil {
+		return nil
+	}
+	s.addrMu.RLock()
+	defer s.addrMu.RUnlock()
+	out := make([]string, len(s.boundAddrs))
+	copy(out, s.boundAddrs)
+	return out
+}
+
+// Ready returns a channel that is closed once the server has bound its TCP listener(s) and started serving.
 func (s *Server) Ready() <-chan struct{} {
 	return s.readyCh
 }
@@ -247,8 +300,8 @@ func (s *Server) CRLWatcher() *pki.CRLWatcher {
 	return s.crlWatcher
 }
 
-// ListenAndServe strictly binds TCP on Config.BindIP:Config.Port and serves mTLS 1.3 WebSocket requests
-// until ctx is canceled or Close is called. Fails fast if the bind IP interface is down or unassignable.
+// ListenAndServe binds all configured TCP listeners via netbind.WaitAndBind and serves mTLS 1.3 WebSocket requests
+// until ctx is canceled or Close is called.
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	if s == nil {
 		return errors.New("server is nil")
@@ -257,14 +310,19 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		ctx = context.Background()
 	}
 
-	listenAddr := net.JoinHostPort(s.cfg.BindIP, strconv.Itoa(s.cfg.Port))
-	ln, err := net.Listen("tcp", listenAddr)
+	listeners, err := netbind.WaitAndBindWithOptions(ctx, netbind.BindOptions{
+		Specs:             s.cfg.BindSpecs,
+		DefaultPort:       s.cfg.Port,
+		AllowPortOverride: false,
+		WaitTimeout:       s.cfg.WaitBind,
+		InterfaceProvider: s.cfg.InterfaceProvider,
+	})
 	if err != nil {
 		_ = s.Close()
-		return fmt.Errorf("failed to bind TCP listener on %s: %w", listenAddr, err)
+		return fmt.Errorf("failed to bind TCP listener(s): %w", err)
 	}
 
-	return s.Serve(ctx, ln)
+	return s.ServeListeners(ctx, listeners)
 }
 
 // Serve wraps ln with the server's strict mTLS 1.3 + CRL configuration and serves requests
@@ -277,19 +335,44 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		_ = s.Close()
 		return errors.New("listener cannot be nil")
 	}
+	return s.ServeListeners(ctx, []net.Listener{ln})
+}
+
+// ServeListeners wraps every listener in listeners with strict mTLS 1.3 + CRL verification and serves
+// requests concurrently until ctx is canceled or Close is called. If any listener exits unexpectedly
+// before shutdown, all remaining listeners and the server are closed cleanly.
+func (s *Server) ServeListeners(ctx context.Context, listeners []net.Listener) error {
+	if s == nil {
+		return errors.New("server is nil")
+	}
+	if len(listeners) == 0 {
+		_ = s.Close()
+		return errors.New("at least one listener is required")
+	}
+	for _, ln := range listeners {
+		if ln == nil {
+			_ = netbind.CloseListeners(listeners)
+			_ = s.Close()
+			return errors.New("listener cannot be nil")
+		}
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if s.closed.Load() {
-		_ = ln.Close()
+		_ = netbind.CloseListeners(listeners)
 		return http.ErrServerClosed
 	}
 
 	s.addrMu.Lock()
-	s.boundAddr = ln.Addr().String()
+	s.boundAddrs = netbind.ListenerAddrs(listeners)
 	s.addrMu.Unlock()
 
-	tlsLn := tls.NewListener(ln, s.tlsConfig.Clone())
+	tlsListeners := make([]net.Listener, 0, len(listeners))
+	for _, ln := range listeners {
+		tlsListeners = append(tlsListeners, tls.NewListener(ln, s.tlsConfig.Clone()))
+	}
+
 	s.readyOnce.Do(func() {
 		close(s.readyCh)
 	})
@@ -303,16 +386,37 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		}
 	}()
 
-	serveErr := s.httpServer.Serve(tlsLn)
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var unexpectedErr error
+
+	for _, tlsLn := range tlsListeners {
+		wg.Add(1)
+		go func(l net.Listener) {
+			defer wg.Done()
+			serveErr := s.httpServer.Serve(l)
+			if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+				if !s.closed.Load() && ctx.Err() == nil {
+					errOnce.Do(func() {
+						unexpectedErr = serveErr
+					})
+				}
+				_ = s.Close()
+				return
+			}
+			if !s.closed.Load() && ctx.Err() == nil {
+				// Listener stopped while server was not shutting down; tear down remaining listeners cleanly.
+				_ = s.Close()
+			}
+		}(tlsLn)
+	}
+
+	wg.Wait()
 	close(serveDoneCh)
 
 	closeErr := s.Close()
-
-	if errors.Is(serveErr, http.ErrServerClosed) && (ctx.Err() != nil || s.closed.Load()) {
-		return closeErr
-	}
-	if serveErr != nil {
-		return serveErr
+	if unexpectedErr != nil {
+		return unexpectedErr
 	}
 	return closeErr
 }

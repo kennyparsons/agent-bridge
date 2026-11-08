@@ -24,10 +24,12 @@ const (
 	// Domain-separation prefixes for cluster cryptographic signatures.
 	policySignatureDomainPrefix = "agent-bridge-policy-v1:"
 	joinPoPDomainPrefix         = "agent-bridge-join-pop-v1:"
+	renewPoPDomainPrefix        = "agent-bridge-renew-pop-v1:"
 	joinTokenHashDomainPrefix   = "agent-bridge-join-token-v1:"
 
 	// Cluster HTTP/1.1 + HTTP/2 over TLS 1.3 control-plane API paths.
 	pathClusterJoin     = "/cluster/v1/join"
+	pathClusterRenew    = "/cluster/v1/renew"
 	pathClusterSignJoin = "/cluster/v1/sign-join"
 	pathClusterSyncPush = "/cluster/v1/sync-push"
 	pathClusterSyncPull = "/cluster/v1/sync-pull"
@@ -331,23 +333,24 @@ func computePolicyDigest(canonicalBytes []byte) [32]byte {
 
 // ClusterStatus summarizes local node identity, topology-aware quorum, leadership, CRL, policy, and peers.
 type ClusterStatus struct {
-	NodeID         string                   `json:"node_id"`
-	ClusterAddr    string                   `json:"cluster_addr"`
-	ExecAddr       string                   `json:"exec_addr,omitempty"`
-	Topology       TopologyMode             `json:"topology"`
-	QuorumState    QuorumState              `json:"quorum_state"`
-	HasQuorum      bool                     `json:"has_quorum"`
-	TotalNodes     int                      `json:"total_nodes"`
-	AliveNodes     int                      `json:"alive_nodes"`
-	QuorumRequired int                      `json:"quorum_required"`
-	LeaderID       string                   `json:"leader_id,omitempty"`
-	LeaderAddr     string                   `json:"leader_addr,omitempty"`
-	IsLeader       bool                     `json:"is_leader"`
-	HasCAKey       bool                     `json:"has_ca_key"`
-	CRLNumber      string                   `json:"crl_number,omitempty"`
-	RevokedCerts   int                      `json:"revoked_certs"`
-	Policy         protocol.ExecutionPolicy `json:"policy"`
-	Peers          []PeerInfo               `json:"peers"`
+	NodeID           string                   `json:"node_id"`
+	ClusterAddr      string                   `json:"cluster_addr"`
+	ClusterBindAddrs []string                 `json:"cluster_bind_addrs,omitempty"`
+	ExecAddr         string                   `json:"exec_addr,omitempty"`
+	Topology         TopologyMode             `json:"topology"`
+	QuorumState      QuorumState              `json:"quorum_state"`
+	HasQuorum        bool                     `json:"has_quorum"`
+	TotalNodes       int                      `json:"total_nodes"`
+	AliveNodes       int                      `json:"alive_nodes"`
+	QuorumRequired   int                      `json:"quorum_required"`
+	LeaderID         string                   `json:"leader_id,omitempty"`
+	LeaderAddr       string                   `json:"leader_addr,omitempty"`
+	IsLeader         bool                     `json:"is_leader"`
+	HasCAKey         bool                     `json:"has_ca_key"`
+	CRLNumber        string                   `json:"crl_number,omitempty"`
+	RevokedCerts     int                      `json:"revoked_certs"`
+	Policy           protocol.ExecutionPolicy `json:"policy"`
+	Peers            []PeerInfo               `json:"peers"`
 }
 
 // TokenCreateRequest specifies parameters for minting a single-use cryptographic join token.
@@ -390,14 +393,16 @@ type SyncResult struct {
 
 // JoinRequest is submitted by a joining node to POST /cluster/v1/join in either Mode A (CSR) or Mode B (pre-issued cert).
 type JoinRequest struct {
-	Token              string `json:"token"`
-	NodeID             string `json:"node_id"`
-	ClusterAddr        string `json:"cluster_addr"`
-	ExecAddr           string `json:"exec_addr,omitempty"`
-	Hostname           string `json:"hostname,omitempty"`
-	CSRPEM             string `json:"csr_pem,omitempty"`
-	ExistingCertPEM    string `json:"existing_cert_pem,omitempty"`
-	PoPSignatureBase64 string `json:"pop_signature_base64,omitempty"`
+	Token              string   `json:"token"`
+	NodeID             string   `json:"node_id"`
+	ClusterAddr        string   `json:"cluster_addr"`
+	ExecAddr           string   `json:"exec_addr,omitempty"`
+	Hostname           string   `json:"hostname,omitempty"`
+	CSRPEM             string   `json:"csr_pem,omitempty"`
+	ExistingCertPEM    string   `json:"existing_cert_pem,omitempty"`
+	PoPSignatureBase64 string   `json:"pop_signature_base64,omitempty"`
+	ExtraIPs           []string `json:"extra_ips,omitempty"`
+	ExtraDNSNames      []string `json:"extra_dns_names,omitempty"`
 }
 
 // JoinResponse is returned by POST /cluster/v1/join upon successful cryptographic admission.
@@ -411,11 +416,43 @@ type JoinResponse struct {
 	Peers         []PeerInfo            `json:"peers"`
 }
 
+// RenewRequest is submitted over authenticated peer mTLS 1.3 to POST /cluster/v1/renew to rotate or
+// expand an existing cluster member's leaf certificate without requiring a single-use join token.
+type RenewRequest struct {
+	NodeID             string   `json:"node_id"`
+	ClusterAddr        string   `json:"cluster_addr"`
+	ExecAddr           string   `json:"exec_addr,omitempty"`
+	Hostname           string   `json:"hostname,omitempty"`
+	CSRPEM             string   `json:"csr_pem,omitempty"`
+	ExistingCertPEM    string   `json:"existing_cert_pem,omitempty"`
+	PoPSignatureBase64 string   `json:"pop_signature_base64,omitempty"`
+	ExtraIPs           []string `json:"extra_ips,omitempty"`
+	ExtraDNSNames      []string `json:"extra_dns_names,omitempty"`
+	RevokeOldSerial    bool     `json:"revoke_old_serial,omitempty"`
+}
+
+// RenewResponse is returned by POST /cluster/v1/renew upon successful peer certificate rotation.
+type RenewResponse struct {
+	NodeID           string                `json:"node_id"`
+	OldCertSerialHex string                `json:"old_cert_serial_hex,omitempty"`
+	CertSerialHex    string                `json:"cert_serial_hex"`
+	IssuedCertPEM    string                `json:"issued_cert_pem,omitempty"`
+	CACertPEM        string                `json:"ca_cert_pem"`
+	CRLPEM           string                `json:"crl_pem"`
+	OldSerialRevoked bool                  `json:"old_serial_revoked"`
+	JoinedAtUnix     int64                 `json:"joined_at_unix"`
+	Incarnation      uint64                `json:"incarnation"`
+	SignedPolicy     *SignedPolicyEnvelope `json:"signed_policy,omitempty"`
+	Peers            []PeerInfo            `json:"peers"`
+}
+
 // signJoinForwardRequest is sent over peer mTLS from a non-CA node to an alive HasCAKey authority peer.
 type signJoinForwardRequest struct {
-	JoinRequest      JoinRequest  `json:"join_request"`
-	ObservedRemoteIP string       `json:"observed_remote_ip,omitempty"`
-	TokenRecord      *TokenRecord `json:"token_record,omitempty"`
+	JoinRequest      JoinRequest   `json:"join_request"`
+	RenewRequest     *RenewRequest `json:"renew_request,omitempty"`
+	CallerCertSerial string        `json:"caller_cert_serial,omitempty"`
+	ObservedRemoteIP string        `json:"observed_remote_ip,omitempty"`
+	TokenRecord      *TokenRecord  `json:"token_record,omitempty"`
 }
 
 // GossipPayload is exchanged over peer mTLS on /cluster/v1/sync-push and /cluster/v1/sync-pull.

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -145,12 +146,24 @@ func (e *Engine) collectGossipTargets() (peers []PeerInfo, undiscoveredSeeds []s
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	knownAddrs := make(map[string]struct{}, len(e.peers)+1)
+	knownAddrs := make(map[string]struct{}, len(e.peers)+4)
 	if selfAddr := e.currentAdvertisedAddr(); selfAddr != "" {
 		knownAddrs[selfAddr] = struct{}{}
 	}
-	if boundAddr := e.Addr(); boundAddr != "" {
+	for _, boundAddr := range e.BoundAddrs() {
+		if boundAddr == "" {
+			continue
+		}
 		knownAddrs[boundAddr] = struct{}{}
+		if h, p, err := net.SplitHostPort(boundAddr); err == nil {
+			if ip := net.ParseIP(h); ip != nil && ip.IsUnspecified() {
+				if ip.To4() != nil {
+					knownAddrs[net.JoinHostPort("127.0.0.1", p)] = struct{}{}
+				} else {
+					knownAddrs[net.JoinHostPort("::1", p)] = struct{}{}
+				}
+			}
+		}
 	}
 
 	for id, p := range e.peers {
@@ -650,8 +663,17 @@ func (e *Engine) mergeGossipPayload(
 			continue
 		}
 
-		if p.Incarnation > existing.Incarnation {
-			existing.Incarnation = p.Incarnation
+		serialEpochAdvanced := existing.CertSerialHex != "" &&
+			p.CertSerialHex != "" &&
+			!strings.EqualFold(existing.CertSerialHex, p.CertSerialHex) &&
+			p.JoinedAtUnix > existing.JoinedAtUnix
+
+		if p.Incarnation > existing.Incarnation || serialEpochAdvanced {
+			nextInc := p.Incarnation
+			if serialEpochAdvanced && nextInc <= existing.Incarnation {
+				nextInc = existing.Incarnation + 1
+			}
+			existing.Incarnation = nextInc
 			if p.ClusterAddr != "" {
 				existing.ClusterAddr = p.ClusterAddr
 			}
